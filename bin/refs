@@ -37,6 +37,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import sys
 import time
 import unicodedata
@@ -632,6 +633,7 @@ def marker_start(wait: int = 300) -> None:
                                 stdin=subprocess.DEVNULL, start_new_session=True, env=env)
     MARKER_PID.write_text(str(proc.pid))
     info(f"starting the local Marker server (pid {proc.pid}); it keeps running until `refs marker stop`.")
+    info(f"      log: {MARKER_LOG}")
     for _ in range(wait):
         if proc.poll() is not None:
             die(f"the Marker server exited during start-up; see {MARKER_LOG}")
@@ -678,8 +680,22 @@ def _ocr_marker(pdf: Path) -> dict:
         "paginate_output": True,
         "mode": os.environ.get("FORGE_MARKER_MODE", "balanced"),
     }
-    body, _ = http(base + "/marker", data=json.dumps(payload).encode(), timeout=3600, retries=1,
-                   headers={"Content-Type": "application/json", "Accept": "application/json"})
+    # Marker answers only when the whole PDF is done (the first run on a GPU machine also
+    # downloads its model container), so print a heartbeat to show it is still working.
+    started = time.time()
+    done = threading.Event()
+
+    def heartbeat() -> None:
+        while not done.wait(60):
+            info(f"      ... still converting {pdf.name} ({int(time.time() - started) // 60} min); "
+                 f"Marker's log: {MARKER_LOG}")
+
+    threading.Thread(target=heartbeat, daemon=True).start()
+    try:
+        body, _ = http(base + "/marker", data=json.dumps(payload).encode(), timeout=3600, retries=1,
+                       headers={"Content-Type": "application/json", "Accept": "application/json"})
+    finally:
+        done.set()
     out = json.loads(body)
     if not out.get("success"):
         raise RuntimeError(f"Marker failed: {out.get('error')}")
@@ -1035,6 +1051,8 @@ def cmd_convert(proj: Project, args) -> int:
         if not is_cached(sha) and time.time() - started > args.budget:
             deferred += 1
             continue
+        if not is_cached(sha):
+            info(f"conv  {pdf.name} ({pdf.stat().st_size // 1024} KB) ...")
         try:
             resp, hit = ocr_pdf(pdf, sha)
         except Exception as e:  # noqa: BLE001
