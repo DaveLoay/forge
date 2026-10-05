@@ -64,6 +64,19 @@ fi
 if [ "$GPU" = 1 ]; then
   if command -v docker >/dev/null && docker info 2>/dev/null | grep -qi 'nvidia'; then
     ok "Docker with the NVIDIA runtime: Marker will run its model on the GPU (vLLM container)"
+    # The default vLLM image may be built for a newer CUDA than the driver supports
+    # (error 804, "forward compatibility ... on non supported HW", on GeForce cards).
+    DRV_CUDA="$(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9]*\).*/\1/p' | head -1)"
+    IMG="$("$VENV/bin/python" -c 'from surya.settings import settings; print(settings.VLLM_DOCKER_IMAGE)' 2>/dev/null)"
+    if [ -n "$DRV_CUDA" ] && [ -n "$IMG" ] && [ "${DRV_CUDA%%.*}" -lt 13 ] && ! echo "$IMG" | grep -q -- '-cu'; then
+      if [ "$DRV_CUDA" = "12.9" ] || [ "${DRV_CUDA#12.}" -ge 9 ] 2>/dev/null; then
+        "$FORGE/bin/refs" marker env "VLLM_DOCKER_IMAGE=${IMG}-cu129" >/dev/null
+        "$FORGE/bin/refs" marker stop >/dev/null 2>&1
+        ok "driver supports CUDA $DRV_CUDA: Marker set to use ${IMG}-cu129 (refs marker env)"
+      else
+        warn "driver supports only CUDA $DRV_CUDA; the vLLM image needs 12.9 or newer. Update the NVIDIA driver (sudo ubuntu-drivers install), or use llama.cpp (export SURYA_INFERENCE_BACKEND=llamacpp)"
+      fi
+    fi
     echo "        the first conversion downloads the vLLM image and the model (several GB); later ones are fast"
   elif command -v docker >/dev/null; then
     warn "Docker is installed but has no NVIDIA runtime. Install the NVIDIA Container Toolkit:"

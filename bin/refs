@@ -10,6 +10,7 @@ Commands:
   refs resolve ID...      check that IDs exist (Crossref / arXiv), no download; JSON out
   refs pool add|remove|list|find   the paper pool: converted papers that fetch reuses first
   refs marker start|stop|status   control the local Marker OCR server (convert starts it on demand)
+  refs marker env [KEY=VALUE ...]  machine-specific Marker settings, e.g. VLLM_DOCKER_IMAGE
 
 Standard library only (Python 3.10+). OCR runs on a self-hosted Marker server
 by default (free, local); Mistral is optional. Environment:
@@ -628,6 +629,9 @@ def marker_start(wait: int = 300) -> None:
     run_dir = FORGE_HOME / "marker-run"
     run_dir.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_CHILD_SESSION"}
+    # Machine-specific Marker settings (e.g. VLLM_DOCKER_IMAGE for an older NVIDIA driver),
+    # kept in ~/.config/forge/config.json so every session gets them, not just login shells.
+    env.update({k: str(v) for k, v in read_config().get("marker_env", {}).items()})
     with MARKER_LOG.open("ab") as log:
         proc = subprocess.Popen([str(MARKER_BIN), "--port", str(port)], cwd=run_dir, stdout=log, stderr=log,
                                 stdin=subprocess.DEVNULL, start_new_session=True, env=env)
@@ -660,6 +664,26 @@ def marker_stop() -> None:
 
 
 def cmd_marker(proj: Project, args) -> int:
+    if args.action == "env":
+        cfg = read_config()
+        menv = cfg.get("marker_env", {})
+        for item in args.settings:
+            k, sep, v = item.partition("=")
+            if not sep:
+                die(f"expected KEY=VALUE, got {item!r}")
+            if v:
+                menv[k] = v
+            else:
+                menv.pop(k, None)
+        if args.settings:
+            cfg["marker_env"] = menv
+            write_config(cfg)
+            info("saved. Restart Marker for it to take effect: refs marker stop (the next convert starts it again)")
+        for k, v in menv.items():
+            info(f"{k}={v}")
+        if not menv:
+            info("no Marker settings.")
+        return 0
     if args.action == "start":
         marker_start()
     elif args.action == "stop":
@@ -1365,7 +1389,9 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("action", choices=("add", "remove", "list", "find"))
     pl.add_argument("arg", nargs="?", default="", help="folder for add/remove, words for find")
     mk = sub.add_parser("marker", help="start, stop or check the local Marker OCR server")
-    mk.add_argument("action", choices=("start", "stop", "status"))
+    mk.add_argument("action", choices=("start", "stop", "status", "env"))
+    mk.add_argument("settings", nargs="*", metavar="KEY=VALUE",
+                    help="for env: Marker settings to save (KEY= removes one)")
     args = ap.parse_args(argv)
     proj = Project.find(args.root)
     handler = {"convert": cmd_convert, "fetch": cmd_fetch, "catalog": cmd_catalog,
