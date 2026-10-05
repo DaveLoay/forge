@@ -2,10 +2,118 @@
 
 forge turns a research idea into working, tested code, one checked step at a time. You stay in control: every stage stops for your approval, every action is logged, and the rules each AI agent must follow are enforced by code, not by asking it nicely.
 
+New to forge? Start with the **[quick setup guide](docs/QUICKSTART.md)**. Once forge is set up, a whole project is:
+
+```bash
+forge new my-project       # creates the project and opens the Interrogator; approve the brief, then /exit
+forge                      # in the project: opens the right session for where it stands
 ```
- idea ──► 1 Interrogator ──► 2 Investigate ──► 3 Plan ──► 4 You review ──► 5 Build ──► review
-          brief.md           papers + index     design,      the design      code, slice
-                                                plan, tests                   by slice
+
+and inside Claude Code just two commands, repeated: **`/forge:next`** (runs the next stage) and **`/forge:approve <what it names>`**.
+
+## How the agents work together
+
+Each box is an AI agent (with its model), each slanted box is a file it writes, and each hexagon is a point where **you** approve before anything else happens. Grey boxes are plain programs, not AI.
+
+```mermaid
+flowchart TD
+    idea(["💡 your idea"])
+
+    subgraph S1["① Interrogate · forge new / forge"]
+        INT["Interrogator<br/>Sonnet · asks you questions"]
+    end
+    idea --> INT
+    INT --> brief[/"brief.md"/]
+    brief --> A1{{"✋ /forge:approve brief"}}
+
+    subgraph S2["② Investigate · /forge:investigate"]
+        CUR["Mr. Curiosity × one per sub-question<br/>Sonnet · searches the web"]
+        HH1["Hungry-hippo<br/>Haiku · fetches seed papers, checks IDs"]
+    end
+    A1 --> CUR & HH1
+    CUR -- "paper IDs" --> HH1
+    HH1 --> cand[/"candidates.md"/]
+    cand --> A2{{"✋ keep / drop papers<br/>/forge:approve candidates"}}
+
+    subgraph S2b["② Investigate · /forge:investigate-index"]
+        HH2["Hungry-hippo<br/>Haiku · brings in kept papers"]
+        REFS["refs + Marker<br/>pool → download → PDF to Markdown"]
+        PTR["Pointer × one per sub-question<br/>Haiku · finds the exact passages"]
+    end
+    A2 --> HH2 --> REFS --> PTR
+    PTR --> index[/"index.md<br/>question → paper, section, lines"/]
+    index --> A3{{"✋ /forge:approve index"}}
+
+    subgraph S3["③ Plan · /forge:plan · up to 3 rounds"]
+        OZ1["Ozymandias<br/>Opus · drafts / revises"]
+        JJJ["J. Jonah Jameson<br/>Sonnet · criticises, with evidence"]
+        SM["Smithers<br/>Sonnet · rebuts or concedes"]
+        OZ2["Ozymandias<br/>Opus · rules on every critique"]
+        OZ3["Ozymandias<br/>Opus · writes the tests"]
+        OZ1 --> JJJ --> SM --> OZ2
+        OZ2 -- "an accepted major problem remains" --> OZ1
+    end
+    A3 --> OZ1
+    OZ2 -- "no major problem left" --> OZ3
+    OZ3 --> plan[/"design.md · plan.md · ledger.md · tests/"/]
+
+    plan --> A4{{"✋ ④ you read design.md<br/>/forge:approve design<br/>🔒 tests/ are now locked"}}
+
+    subgraph S5["⑤ Build · /forge:build · one slice per run"]
+        MF["MF-CODE<br/>Sonnet · writes the code for one slice"]
+        FT["forge-test<br/>runs the slice's tests, records the result"]
+        MF --> FT
+        FT -- "fail, up to 3 attempts" --> MF
+    end
+    A4 --> MF
+    FT -- "pass" --> slice[/"slices/slice-N.md"/]
+    FT -- "still failing after 3" --> blocker[/"blocker report<br/>back to planning"/]
+    slice --> A5{{"✋ /forge:approve slice-N"}}
+    A5 -- "more slices" --> MF
+    A5 -- "last slice done" --> REV["Reviewer<br/>Sonnet · compares code with plan"]
+    REV --> review[/"review.md"/]
+
+    classDef agent fill:#dbeafe,stroke:#2563eb,color:#0f172a
+    classDef file fill:#fef9c3,stroke:#ca8a04,color:#0f172a
+    classDef gate fill:#dcfce7,stroke:#16a34a,color:#0f172a
+    classDef tool fill:#e5e7eb,stroke:#6b7280,color:#0f172a
+    class INT,CUR,HH1,HH2,PTR,OZ1,JJJ,SM,OZ2,OZ3,MF,REV agent
+    class brief,cand,index,plan,slice,blocker,review file
+    class A1,A2,A3,A4,A5 gate
+    class REFS,FT tool
+```
+
+### Who does what
+
+| Agent | Model | Stage | Job | May write |
+|---|---|---|---|---|
+| **Interrogator** | Sonnet | 1 | Talks with you until the idea is precise | `pipeline/brief.md` |
+| **Mr. Curiosity** | Sonnet | 2 | Searches for papers, one instance per research sub-question | nothing |
+| **Hungry-hippo** | Haiku | 2 | The clerk: runs `refs` to verify, fetch and convert papers | `pipeline/candidates.md` |
+| **Pointer** | Haiku | 2 | Finds which paper, section and lines answer each sub-question | `pipeline/index.md` |
+| **Ozymandias** | Opus | 3 | Architect and judge: drafts the design, rules on critiques, writes tests | `design.md`, `plan.md`, `ledger.md`, `tests/` |
+| **J. Jonah Jameson** | Sonnet | 3 | Critic: a fresh instance every round, attacks the plan with evidence | nothing |
+| **Smithers** | Sonnet | 3 | Defender: rebuts each critique with evidence, or concedes it | nothing |
+| **MF-CODE** | Sonnet | 5 | Builds one slice of the plan | `src/`, `docs/`, … never `tests/` |
+| **Reviewer** | Sonnet | 5 | Checks that what was built is what was planned | `pipeline/review.md` |
+
+### The guard: how every action is checked
+
+Agents don't just promise to follow these rules. A hook that Claude Code runs before every action enforces them:
+
+```mermaid
+flowchart LR
+    act["an agent tries an action<br/>write a file, run a command…"] --> guard{"forge guard<br/>is this inside the agent's job?"}
+    guard -- "yes" --> ok["action runs"]
+    guard -- "no" --> no["blocked, with the reason<br/>told to the agent"]
+    ok & no --> log[/"pipeline/run-log.md<br/>one line per action"/]
+
+    classDef file fill:#fef9c3,stroke:#ca8a04,color:#0f172a
+    classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a
+    classDef bad fill:#fee2e2,stroke:#dc2626,color:#0f172a
+    class log file
+    class ok good
+    class no bad
 ```
 
 ## What forge is, in plain English
@@ -15,22 +123,22 @@ forge is a **plugin for Claude Code**. A plugin is a folder that Claude Code loa
 | Building block | What it is | In forge |
 |---|---|---|
 | **Agents** (`agents/*.md`) | A specialised AI worker: a role description, a model (Opus, Sonnet or Haiku) and a list of tools it may use. | Interrogator, Hungry-hippo, Mr. Curiosity, Pointer, Ozymandias, J. Jonah Jameson, Smithers, MF-CODE, Reviewer |
-| **Skills** (`skills/*/SKILL.md`) | Commands you type, such as `/forge:status`. | `/forge:init`, `/forge:status`, `/forge:approve` |
+| **Skills** (`skills/*/SKILL.md`) | Commands you type, such as `/forge:status`. | `/forge:next`, `/forge:approve`, `/forge:status`, `/forge:init` |
 | **Workflows** (`workflows/*.js`) | Small JavaScript programs that run agents in a fixed order. The *script*, not the AI, decides what runs next, so steps can't be skipped. | `/forge:investigate`, `/forge:investigate-index`, `/forge:plan`, `/forge:build` |
 | **Hooks** (`hooks/`) | Code that Claude Code runs before and after every action an agent takes. It can block the action. | the **forge guard**: it allows each agent only its own job and writes the logbook |
-| **Tools** (`bin/`) | Ordinary command-line programs that agents (and you) can run. | `refs` (papers), `forge-init`, `forge-approve`, `forge-gate`, `forge-test`, `forge-build-status` |
+| **Tools** (`bin/`) | Ordinary command-line programs that agents (and you) can run. | `forge` (the launcher), `refs` (papers), `forge-init`, `forge-approve`, `forge-gate`, `forge-test`, `forge-build-status` |
 
 So forge is not one thing. It is a set of agents with narrow jobs, workflows that run them in order, a guard that keeps them in their lane, and tools that do the parts that should be exact (downloading, converting, checking, testing) without AI.
 
 ## The pipeline, step by step
 
-Each stage reads the files the previous stage wrote, and refuses to start until you've approved them.
+Each stage reads the files the previous stage wrote, and refuses to start until you've approved them. You don't need to remember the commands below: `/forge:next` always runs the right one, and `forge status` (in a terminal) tells you where you are.
 
 ### 1. Interrogator: from idea to brief
 
 You talk with the Interrogator until your idea is precise. If you name papers, it fetches and converts them (through `refs`) and reads them, so its questions are informed. It writes `pipeline/brief.md`: goal, non-goals, hypothesis, acceptance criteria that can be tested, constraints, research sub-questions, seed references.
 
-- Start it: `claude --agent forge:interrogator` (in the project folder)
+- Start it: `forge new <folder>` for a new project, or `forge` in a project whose brief isn't approved yet
 - Approve: `/forge:approve brief`
 
 ### 2. Investigate: from brief to the right passages in the right papers
@@ -102,37 +210,22 @@ my-project/
 
 ## Setting up on a new machine
 
-forge needs:
-
-1. **Claude Code**, logged in, with **Dynamic workflows** turned on (`/config` → Dynamic workflows; on the Pro plan it starts switched off).
-2. **Python 3.10+** and `curl` (forge itself uses only Python's standard library).
-3. **Marker** for converting PDFs (free, local):
-   ```bash
-   python3 -m venv ~/.local/share/forge/marker-venv
-   ~/.local/share/forge/marker-venv/bin/pip install marker-pdf==2.0.0 fastapi uvicorn python-multipart
-   ```
-   plus `llama.cpp` (`brew install llama.cpp` on macOS; on Linux, see "Running on a server" below).
-4. **The forge folder**, then in each project:
-   ```bash
-   claude --plugin-dir /path/to/forge
-   ```
-   and `/forge:init` once, to create the project layout.
-5. Optional: `refs pool add <folder>` for your paper pool.
-
-## Running on a server
-
-forge has no macOS-specific parts at runtime. On a Linux server:
+The short version is in the [quick setup guide](docs/QUICKSTART.md). On macOS or Linux:
 
 ```bash
 git clone git@github.com:DaveLoay/forge.git ~/forge
 bash ~/forge/scripts/setup.sh --pool "/path/to/your/vault" --test
 ```
 
-`setup.sh` checks Python, git and Claude Code, installs Marker, tells you how Marker will use the GPU, registers the paper pool, and with `--test` converts one real paper end to end. It never uses `sudo`; anything that needs root is printed for you to run. Update forge later with `git -C ~/forge pull`. Then, in a project on the server: `claude --plugin-dir ~/forge`.
+`setup.sh` checks Python, git and Claude Code, installs Marker (into `~/.local/share/forge`), tells you how Marker will use the GPU, installs forge as a Claude Code plugin (so plain `claude` loads it, no `--plugin-dir`), puts the `forge` command in `~/.local/bin`, registers the paper pool, and with `--test` converts one real paper end to end. It never uses `sudo`; anything that needs root is printed for you to run. It is safe to re-run.
 
-What else changes on a server:
+Then, once: in Claude Code, `/config` → turn on **Dynamic workflows** (on the Pro plan it starts switched off). Update forge later with `forge update`.
 
-- **Get forge onto the server.** Simplest: keep forge in a (private) GitHub repository and `git clone` it on the server, then `git pull` to update. Or install it as a plugin (`/plugin marketplace add <you>/forge`, `/plugin install forge@forge`), which updates everywhere with `/plugin marketplace update forge`.
+## Running on a server
+
+forge has no macOS-specific parts at runtime; the setup above is the same on a Linux server. What else changes on a server:
+
+- **Get forge onto the server.** Keep forge in a (private) GitHub repository and `git clone` it on the server; `forge update` pulls and refreshes the plugin.
 - **Claude Code on the server.** Install it there, log in once, and turn on Dynamic workflows in `/config`. Run it inside `tmux` or `screen`, so a long `/forge:plan` or `/forge:build` keeps running if your SSH connection drops.
 - **Marker on the server.** With an NVIDIA GPU, Marker runs its model in a Docker container (vLLM), so the server needs Docker and the NVIDIA Container Toolkit; the first conversion downloads the container and the model (several GB). Without Docker, build `llama.cpp` with CUDA and set `export SURYA_INFERENCE_BACKEND=llamacpp`. `setup.sh` tells you which applies.
 - **The paper pool on the server.** Your Obsidian vault lives on your Mac, so the server needs a copy of the papers folder, kept in sync with `rsync`, Syncthing or git. Then run `refs pool add <that folder>` on the server.
@@ -142,12 +235,15 @@ What else changes on a server:
 
 | Command | What it does |
 |---|---|
-| `/forge:init` | Create the forge layout in the current folder |
-| `/forge:status` | Where the project stands, approvals, last logbook lines, next step |
-| `claude --agent forge:interrogator` | Stage 1 |
-| `/forge:investigate`, `/forge:investigate-index` | Stage 2 (two parts, with your approval in between) |
-| `/forge:plan` | Stage 3 |
-| `/forge:build` | Stage 5, one slice per run; final review after the last |
+| `forge new <folder>` | (terminal) Create a forge project and open the Interrogator |
+| `forge` | (terminal, in a project) Open the right Claude Code session for where the project stands |
+| `forge status` | (terminal) Where the project stands and what to type next |
+| `forge update` | (terminal) Pull the latest forge and refresh the plugin |
+| `/forge:next` | Run the next stage, or say exactly what to read and approve |
 | `/forge:approve <brief, candidates, index, design, slice-N>` | Record your approval |
+| `/forge:status` | Fuller report: approvals, papers, build, last logbook lines |
+| `/forge:init` | Create the forge layout in the current folder (`forge new` does this for you) |
+| `/forge:investigate`, `/forge:investigate-index`, `/forge:plan`, `/forge:build` | The stage workflows, if you want to run one directly |
+| `claude --agent forge:interrogator` | Stage 1 by hand (what `forge` runs for you) |
 
 For developers: the design and its history are in [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md). Run the tests with `python3 -m unittest discover -s tests`, and check the plugin with `claude plugin validate .`.

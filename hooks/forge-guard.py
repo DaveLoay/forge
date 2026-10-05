@@ -220,7 +220,7 @@ def bash_is_readonly(cmd: str) -> bool:
                 return False
         elif exe in ("forge-gate", "forge-build-status"):
             continue
-        elif exe == "refs":
+        elif exe in ("refs", "forge"):
             if len(words) < 2 or words[1] != "status":
                 return False
         elif exe == "find":

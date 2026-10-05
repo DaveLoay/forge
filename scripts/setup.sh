@@ -5,7 +5,8 @@
 #   bash scripts/setup.sh --pool "/path/to/vault"   # also register the paper pool
 #   bash scripts/setup.sh --test               # also convert one real paper end to end
 #
-# Installs only into ~/.local/share/forge (the Marker environment). Never uses sudo:
+# Installs Marker into ~/.local/share/forge, the forge plugin into Claude Code, and links
+# the forge command into ~/.local/bin. Never uses sudo:
 # anything that needs root is printed as a command for you to run.
 set -u
 FORGE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -116,9 +117,29 @@ else
     || ok "$("$FORGE/bin/refs" pool list | head -1)"
 fi
 
+echo
+echo "5. forge in Claude Code and on your PATH"
+if command -v claude >/dev/null; then
+  if claude plugin list 2>/dev/null | grep -q 'forge@forge'; then
+    ok "forge plugin installed (plain \`claude\` loads it; update with: forge update)"
+  elif claude plugin marketplace add "$FORGE" >/dev/null 2>&1 || claude plugin marketplace list 2>/dev/null | grep -q forge; then
+    claude plugin install forge@forge >/dev/null 2>&1 \
+      && ok "forge plugin installed (plain \`claude\` loads it; update with: forge update)" \
+      || warn "could not install the forge plugin: claude plugin install forge@forge"
+  else
+    warn "could not add the forge marketplace: claude plugin marketplace add \"$FORGE\""
+  fi
+fi
+mkdir -p "$HOME/.local/bin"
+ln -sf "$FORGE/bin/forge" "$HOME/.local/bin/forge"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ok "forge command: $HOME/.local/bin/forge" ;;
+  *) warn "add ~/.local/bin to your PATH for the forge command: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.${SHELL##*/}rc" ;;
+esac
+
 if [ "$TEST" = 1 ]; then
   echo
-  echo "5. End-to-end test: fetch and convert one paper (outside Claude, no time limit)"
+  echo "6. End-to-end test: fetch and convert one paper (outside Claude, no time limit)"
   T="$(mktemp -d)/forge-setup-test"
   "$FORGE/bin/forge-init" "$T" >/dev/null
   ( cd "$T" && "$FORGE/bin/refs" fetch 1412.6980 && "$FORGE/bin/refs" convert --budget 3600 && "$FORGE/bin/refs" status ) \
@@ -128,6 +149,6 @@ fi
 
 echo
 echo "In Claude Code (once per machine): /config -> turn on 'Dynamic workflows'."
-echo "Use forge in a project:  claude --plugin-dir \"$FORGE\"   then /forge:init and /forge:status"
+echo "Start a project:  forge new my-project"
 echo
 [ "$TODO" = 0 ] && echo "All set." || echo "$TODO item(s) marked 'todo' above."

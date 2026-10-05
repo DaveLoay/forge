@@ -19,8 +19,6 @@ Check, in this order:
 
 If neither `references/` nor `pipeline/` exists, say the project has not been initialised for forge yet and that `/forge:init` sets it up.
 
-Finish with the single next step, taken from this order:
-interrogator session (`claude --agent forge:interrogator`) → `/forge:approve brief` → `/forge:investigate` → review `pipeline/candidates.md`, `/forge:approve candidates` → `/forge:investigate-index` → review `pipeline/index.md`, `/forge:approve index` → `/forge:plan` → review `pipeline/design.md`, `/forge:approve design` → `/forge:build` per slice, `/forge:approve slice-N` after each → final review in `pipeline/review.md`.
-If that step's command is not available yet, say it has not been built yet rather than improvising it.
+Finish with the single next step: run `forge status` (or `"${CLAUDE_PLUGIN_ROOT}/bin/forge" status` if `forge` is not on the PATH) and repeat its output. It is decided by code from the approvals; don't improvise a different one. When the step is a workflow, tell the user to type `/forge:next`.
 
 Keep the report under 25 lines.

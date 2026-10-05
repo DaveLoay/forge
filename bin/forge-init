@@ -74,7 +74,7 @@ def main(argv: list[str]) -> int:
             print(f"  + {m}")
     else:
         print(f"{root} is already a forge project; nothing to do.")
-    print("Next: the interrogator session writes pipeline/brief.md (see /forge:status for the command).")
+    print("Next: run `forge` in this folder; it opens the Interrogator, which writes pipeline/brief.md.")
     return 0
 
 

@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""forge: start and continue forge projects.
+
+  forge new DIR      create a forge project in DIR (git repo + layout) and open the Interrogator
+  forge              in a project: open the right Claude Code session for where it stands
+  forge status       in a project: print where it stands and what to type next
+  forge status --json
+  forge update       pull the latest forge and refresh the installed plugin
+
+Claude Code is started with forge loaded: the installed plugin if there is one
+(scripts/setup.sh installs it), otherwise --plugin-dir pointing at this folder.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+import forge_next as fn  # noqa: E402
+
+
+def plugin_installed() -> bool:
+    try:
+        r = subprocess.run(["claude", "plugin", "list"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "forge@forge" in r.stdout
+
+
+def launch(root: Path, agent: str | None) -> int:
+    if not shutil.which("claude"):
+        print("forge: Claude Code (`claude`) is not on PATH: https://code.claude.com/docs/en/setup")
+        return 1
+    cmd = ["claude"]
+    if not plugin_installed():
+        cmd += ["--plugin-dir", str(PLUGIN_ROOT)]
+    if agent:
+        cmd += ["--agent", agent]
+    os.chdir(root)
+    sys.stdout.flush()
+    os.execvp(cmd[0], cmd)
+
+
+def show(step: dict) -> None:
+    print(f"forge · {step['stage']}")
+    print(f"  {step['say'].replace('`', '')}")
+
+
+def project_root() -> Path:
+    root = fn.find_root()
+    if root is None:
+        sys.exit("forge: not inside a forge project. Start one with: forge new <folder>")
+    return root
+
+
+def cmd_new(target: str) -> int:
+    root = Path(target).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=root, capture_output=True).returncode != 0:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        print(f"git repository created in {root}", flush=True)
+    r = subprocess.run([sys.executable, str(PLUGIN_ROOT / "bin" / "forge-init"), str(root)],
+                       capture_output=True, text=True, check=True)
+    print("\n".join(l for l in r.stdout.splitlines() if not l.startswith("Next:")))
+    print()
+    print("Opening the Interrogator. Describe your idea; when the brief reads right, type /forge:approve brief,")
+    print("then /exit and run `forge` again in this folder.")
+    print()
+    return launch(root, "forge:interrogator")
+
+
+def cmd_open() -> int:
+    root = project_root()
+    step = fn.next_step(root)
+    show(step)
+    print()
+    return launch(root, "forge:interrogator" if step["action"] == "interrogator" else None)
+
+
+def cmd_status(as_json: bool) -> int:
+    step = fn.next_step(project_root())
+    if as_json:
+        print(json.dumps(step, indent=1))
+    else:
+        show(step)
+    return 0
+
+
+def cmd_update() -> int:
+    steps = [["git", "-C", str(PLUGIN_ROOT), "pull", "--ff-only"]]
+    if plugin_installed():
+        steps += [["claude", "plugin", "marketplace", "update", "forge"], ["claude", "plugin", "update", "forge@forge"]]
+    for c in steps:
+        print("$ " + " ".join(c))
+        if subprocess.run(c).returncode != 0:
+            return 1
+    print("forge is up to date. Restart open Claude Code sessions to use it.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        return cmd_open()
+    if argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "new" and len(argv) == 2:
+        return cmd_new(argv[1])
+    if argv[0] == "status" and argv[1:] in ([], ["--json"]):
+        return cmd_status(argv[1:] == ["--json"])
+    if argv[0] == "update" and len(argv) == 1:
+        return cmd_update()
+    print(__doc__.strip())
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

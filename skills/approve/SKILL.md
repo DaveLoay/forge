@@ -15,10 +15,7 @@ The user typed `/forge:approve $ARGUMENTS`. Claude Code already ran the approval
 Report that output to the user in one or two lines, verbatim where it matters. Do not run `forge-approve` or `forge-gate` yourself, and do not edit any pipeline file: the approval is recorded only by the line above.
 
 If it says `approved`, name the next step:
-- brief → `/forge:investigate` (in a session without `--agent`)
-- candidates → `/forge:investigate-index`
-- index → `/forge:plan`
-- design → `/forge:build` (this also locked `tests/`)
-- slice-N → `/forge:build` for the next slice (after the last slice, `/forge:build` runs the final review)
+- brief → `/exit`, then run `forge` in this folder and type `/forge:next` (it starts the paper search)
+- anything else → type `/forge:next` (design: mention that `tests/` is now locked)
 
 If it says `NOT approved`, explain the reason it gives and what the user should do.
