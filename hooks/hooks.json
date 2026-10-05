@@ -1,0 +1,14 @@
+{
+  "description": "forge stage guard: shows the active stage, enforces each stage's allowed actions in forge projects, and writes pipeline/run-log.md",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/forge-guard.py"], "timeout": 10 } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/forge-guard.py"], "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/forge-guard.py"], "timeout": 10 } ] }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""forge-approve GATE: record the user's approval of a pipeline file.
+
+Gates: brief, candidates, index, design. Meant to be run only through the user's
+/forge:approve command; the forge guard blocks agents from running it.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import forge_approvals as fa  # noqa: E402
+
+
+def find_root() -> Path:
+    here = Path.cwd().resolve()
+    for d in [here, *here.parents]:
+        if (d / "pipeline").is_dir() and (d / "references").is_dir():
+            return d
+    sys.exit("forge-approve: not inside a forge project (no pipeline/ and references/ here)")
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        print(f"usage: forge-approve GATE   ({fa.known_gates()})")
+        return 2
+    try:
+        print(fa.approve(find_root(), sys.argv[1].strip().lower()))
+    except ValueError as e:
+        print(f"NOT approved: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

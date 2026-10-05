@@ -1,0 +1,16 @@
+{
+  "name": "forge",
+  "owner": {
+    "name": "DaveLoay"
+  },
+  "metadata": {
+    "description": "Marketplace for the forge research-to-code pipeline plugin."
+  },
+  "plugins": [
+    {
+      "name": "forge",
+      "source": "./",
+      "description": "Research-to-code pipeline: interrogate, investigate, plan with a critic council, build against locked tests."
+    }
+  ]
+}

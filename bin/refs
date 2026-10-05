@@ -1,0 +1,1363 @@
+#!/usr/bin/env python3
+"""refs: manage a forge project's references/ folder.
+
+Commands:
+  refs convert            OCR every PDF in references/inbox/ into references/<key>/
+  refs fetch ID...        resolve DOIs / arXiv IDs / URLs, download open-access PDFs to inbox/
+  refs catalog            rebuild references/catalog.md
+  refs bib                rebuild references/references.bib
+  refs status             counts of converted, waiting and missing papers
+  refs resolve ID...      check that IDs exist (Crossref / arXiv), no download; JSON out
+  refs pool add|remove|list|find   the paper pool: converted papers that fetch reuses first
+  refs marker start|stop|status   control the local Marker OCR server (convert starts it on demand)
+
+Standard library only (Python 3.10+). OCR runs on a self-hosted Marker server
+by default (free, local); Mistral is optional. Environment:
+  FORGE_OCR_BACKEND marker (default) or mistral
+  FORGE_MARKER_URL  Marker server (default http://127.0.0.1:8001)
+  FORGE_MARKER_MODE balanced (default, best quality) or fast
+  MISTRAL_API_KEY   needed only with FORGE_OCR_BACKEND=mistral
+  MISTRAL_OCR_MODEL model name (default mistral-ocr-latest)
+  FORGE_EMAIL       contact address for the Crossref polite pool and Unpaywall
+  FORGE_CACHE_DIR   OCR cache location (default ~/.cache/forge/ocr)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import difflib
+import fcntl
+import hashlib
+from http.cookiejar import CookieJar
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+VERSION = "0.2.0"
+MISTRAL_API = "https://api.mistral.ai/v1"
+STOPWORDS = set(
+    """a an the on of in for to and or with without towards toward via from by at as is are be
+    using use what how why when where which who do does can we our its into onto over under about
+    beyond between through new""".split()
+)
+FRONTMATTER_FIELDS = [
+    "key", "title", "authors", "year", "doi", "arxiv", "url",
+    "source", "verified", "converted", "ocr_sha256", "origin",
+]
+SOURCES = ("user", "brief", "curiosity")
+
+DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s\"<>|\]\[]+)", re.I)
+ARXIV_NEW_RE = re.compile(r"(?<![\d.])(\d{4}\.\d{4,5})(v\d+)?(?![\d])")
+ARXIV_OLD_RE = re.compile(r"\b([a-z][a-z\-]+(?:\.[A-Z]{2})?/\d{7})(v\d+)?\b")
+ARXIV_DOI_RE = re.compile(r"^10\.48550/arxiv\.(.+)$", re.I)
+
+
+# --------------------------------------------------------------------------- utilities
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"refs: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"refs: warning: {msg}", file=sys.stderr, flush=True)
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ascii_fold(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+def norm_title(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", ascii_fold(text).lower()).strip()
+
+
+def clean_doi(doi: str) -> str:
+    doi = doi.strip().rstrip(".,;:)")
+    doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)", "", doi, flags=re.I)
+    return doi.lower()
+
+
+def user_agent() -> str:
+    email = os.environ.get("FORGE_EMAIL")
+    ua = f"forge-refs/{VERSION} (https://github.com/; research pipeline)"
+    return ua + (f" mailto:{email}" if email else "")
+
+
+# Some publishers (e.g. Nature) bounce PDF requests through a cookie handshake.
+_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+
+def http(url: str, *, data: bytes | None = None, headers: dict | None = None, method: str | None = None,
+         timeout: int = 60, retries: int = 3) -> tuple[bytes, str]:
+    """GET/POST with retries on 429/5xx. Returns (body, content-type)."""
+    hdrs = {"User-Agent": user_agent()}
+    hdrs.update(headers or {})
+    last: Exception | None = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+        try:
+            with _OPENER.open(req, timeout=timeout) as r:
+                return r.read(), r.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                wait = float(e.headers.get("Retry-After") or 2 ** (attempt + 1))
+                time.sleep(min(wait, 30))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            raise
+    raise last  # pragma: no cover
+
+
+def http_json(url: str, **kw) -> dict:
+    body, _ = http(url, headers={"Accept": "application/json"}, **kw)
+    return json.loads(body)
+
+
+# --------------------------------------------------------------------------- frontmatter
+
+def dump_frontmatter(meta: dict) -> str:
+    lines = ["---"]
+    for k in FRONTMATTER_FIELDS:
+        v = meta.get(k)
+        lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def read_frontmatter(path: Path) -> dict:
+    meta: dict = {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            if f.readline().strip() != "---":
+                return meta
+            for line in f:
+                if line.strip() == "---":
+                    break
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                v = v.strip()
+                try:
+                    meta[k.strip()] = json.loads(v)
+                except json.JSONDecodeError:
+                    meta[k.strip()] = v.strip("'\"")
+    except OSError:
+        pass
+    return meta
+
+
+# --------------------------------------------------------------------------- project layout
+
+class Project:
+    def __init__(self, root: Path):
+        self.root = root
+        self.refs = root / "references"
+        self.inbox = self.refs / "inbox"
+        self.catalog = self.refs / "catalog.md"
+        self.bib = self.refs / "references.bib"
+        self.missing = self.refs / "MISSING.md"
+        self.log = self.refs / "fetch.log"
+
+    @classmethod
+    def find(cls, explicit: str | None) -> "Project":
+        if explicit:
+            return cls(Path(explicit).resolve())
+        here = Path.cwd().resolve()
+        for d in [here, *here.parents]:
+            if (d / "references").is_dir():
+                return cls(d)
+        return cls(here)
+
+    def ensure(self) -> None:
+        self.inbox.mkdir(parents=True, exist_ok=True)
+
+    def papers(self) -> list[tuple[Path, dict]]:
+        out = []
+        if not self.refs.is_dir():
+            return out
+        for d in sorted(self.refs.iterdir()):
+            md = d / f"{d.name}.md"
+            if d.is_dir() and d.name != "inbox" and md.is_file():
+                out.append((d, read_frontmatter(md)))
+        return out
+
+    def inbox_pdfs(self) -> list[Path]:
+        if not self.inbox.is_dir():
+            return []
+        return sorted(p for p in self.inbox.iterdir() if p.suffix.lower() == ".pdf")
+
+    def known_ids(self) -> set[str]:
+        """Lowercased DOIs and arXiv IDs already converted or waiting in the inbox."""
+        ids: set[str] = set()
+        metas = [m for _, m in self.papers()]
+        for side in self.inbox.glob("*.meta.json") if self.inbox.is_dir() else []:
+            try:
+                metas.append(json.loads(side.read_text()))
+            except (OSError, json.JSONDecodeError):
+                pass
+        for m in metas:
+            for f in ("doi", "arxiv"):
+                if m.get(f):
+                    ids.add(str(m[f]).lower())
+        return ids
+
+    def write_log(self, msg: str) -> None:
+        self.refs.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().isoformat(timespec="seconds")
+        with self.log.open("a", encoding="utf-8") as f:
+            f.write(f"{stamp} {msg}\n")
+
+
+# --------------------------------------------------------------------------- MISSING.md
+
+MISSING_HEADER = (
+    "# Missing papers\n\n"
+    "Paywalled or otherwise unavailable. Get the PDF, drop it into `inbox/`, then run `refs convert`.\n\n"
+    "| id | title | reason |\n|---|---|---|\n"
+)
+MISSING_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*$")
+
+
+def read_missing(proj: Project) -> list[tuple[str, str, str]]:
+    rows = []
+    if not proj.missing.is_file():
+        return rows
+    for line in proj.missing.read_text(encoding="utf-8").splitlines():
+        m = MISSING_ROW_RE.match(line)
+        if m and m.group(1) not in ("id", "---"):
+            rows.append((m.group(1), m.group(2), m.group(3)))
+    return rows
+
+
+def write_missing(proj: Project, rows: list[tuple[str, str, str]]) -> None:
+    proj.refs.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"| {i} | {t.replace('|', '/')} | {r.replace('|', '/')} |\n" for i, t, r in rows)
+    proj.missing.write_text(MISSING_HEADER + body, encoding="utf-8")
+
+
+def add_missing(proj: Project, ident: str, title: str, reason: str) -> None:
+    rows = read_missing(proj)
+    if any(r[0].lower() == ident.lower() for r in rows):
+        return
+    rows.append((ident, title, reason))
+    write_missing(proj, rows)
+
+
+def drop_missing(proj: Project, ids: set[str]) -> None:
+    rows = read_missing(proj)
+    keep = [r for r in rows if r[0].lower() not in ids]
+    if len(keep) != len(rows):
+        write_missing(proj, keep)
+
+
+# --------------------------------------------------------------------------- identifiers & metadata
+
+def classify(raw: str) -> tuple[str, str]:
+    """Return (kind, value) with kind in doi|arxiv|url|unknown."""
+    s = raw.strip()
+    low = s.lower()
+    if "arxiv.org/" in low:
+        tail = re.sub(r"^.*arxiv\.org/(abs|pdf|html)/", "", s, flags=re.I)
+        tail = re.sub(r"\.pdf$", "", tail)
+        m = ARXIV_NEW_RE.match(tail) or ARXIV_OLD_RE.match(tail)
+        if m:
+            return "arxiv", m.group(1)
+    if low.startswith("arxiv:"):
+        s = s[6:].strip()
+    m = ARXIV_NEW_RE.fullmatch(s) or ARXIV_OLD_RE.fullmatch(s)
+    if m:
+        return "arxiv", m.group(1)
+    if low.startswith(("http://", "https://")) and "doi.org/" not in low:
+        return "url", s
+    m = DOI_RE.search(s)
+    if m:
+        doi = clean_doi(m.group(1))
+        am = ARXIV_DOI_RE.match(doi)
+        if am:
+            return "arxiv", am.group(1)
+        return "doi", doi
+    return "unknown", s
+
+
+def _crossref_meta(doi: str) -> dict | None:
+    try:
+        data = http_json(f"https://api.crossref.org/works/{urllib.parse.quote(doi)}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    return crossref_item_to_meta(data["message"])
+
+
+def crossref_item_to_meta(it: dict) -> dict:
+    authors = []
+    for a in it.get("author", []):
+        name = " ".join(x for x in (a.get("given"), a.get("family")) if x) or a.get("name", "")
+        if name:
+            authors.append(name)
+    year = None
+    for f in ("issued", "published-print", "published-online", "created"):
+        parts = (it.get(f) or {}).get("date-parts") or [[None]]
+        if parts and parts[0] and parts[0][0]:
+            year = int(parts[0][0])
+            break
+    pdf_links = [
+        l["URL"] for l in it.get("link", [])
+        if "pdf" in (l.get("content-type") or "").lower()
+    ]
+    return {
+        "title": " ".join((it.get("title") or [""])[0].split()),
+        "authors": authors,
+        "family": [a.get("family") or a.get("name", "") for a in it.get("author", [])],
+        "year": year,
+        "doi": (it.get("DOI") or "").lower() or None,
+        "arxiv": None,
+        "url": it.get("URL"),
+        "_pdf_links": pdf_links,
+        "_type": it.get("type"),
+    }
+
+
+def crossref_search_title(title: str) -> dict | None:
+    q = urllib.parse.urlencode({"query.bibliographic": title, "rows": 5})
+    try:
+        items = http_json(f"https://api.crossref.org/works?{q}")["message"]["items"]
+    except Exception as e:  # noqa: BLE001
+        warn(f"Crossref title search failed: {e}")
+        return None
+    want = norm_title(title)
+    for it in items:
+        got = norm_title((it.get("title") or [""])[0])
+        if got and difflib.SequenceMatcher(None, want, got).ratio() >= 0.9:
+            return crossref_item_to_meta(it)
+    return None
+
+
+ATOM = {"a": "http://www.w3.org/2005/Atom", "ax": "http://arxiv.org/schemas/atom"}
+
+
+def _arxiv_meta(aid: str) -> dict | None:
+    q = urllib.parse.urlencode({"id_list": aid, "max_results": 1})
+    arxiv_throttle()
+    body, _ = http(f"https://export.arxiv.org/api/query?{q}", retries=6)
+    root = ET.fromstring(body)
+    entry = root.find("a:entry", ATOM)
+    if entry is None or entry.find("a:title", ATOM) is None:
+        return None
+    eid = (entry.findtext("a:id", "", ATOM) or "")
+    if "api/errors" in eid:
+        return None
+    names = [" ".join((a.findtext("a:name", "", ATOM) or "").split()) for a in entry.findall("a:author", ATOM)]
+    published = entry.findtext("a:published", "", ATOM) or ""
+    doi = entry.findtext("ax:doi", None, ATOM)
+    return {
+        "title": " ".join((entry.findtext("a:title", "", ATOM) or "").split()),
+        "authors": names,
+        "family": [n.split()[-1] if n else "" for n in names],
+        "year": int(published[:4]) if published[:4].isdigit() else None,
+        "doi": doi.lower() if doi else None,
+        "arxiv": aid,
+        "url": f"https://arxiv.org/abs/{aid}",
+        "_pdf_links": [f"https://arxiv.org/pdf/{aid}"],
+    }
+
+
+class LookupUnavailable(RuntimeError):
+    """The metadata service could not be reached or refused (rate limit, outage): retry later."""
+
+
+def meta_cache_dir() -> Path:
+    d = Path(os.environ.get("FORGE_META_CACHE") or Path.home() / ".cache" / "forge" / "meta")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+ARXIV_GAP = 3.1  # seconds between arXiv API requests, as arXiv asks, across all refs processes
+
+
+def arxiv_throttle() -> None:
+    """Space arXiv API calls across concurrent refs processes with a lock file."""
+    d = meta_cache_dir().parent
+    with open(d / "arxiv.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        stamp = d / "arxiv.last"
+        try:
+            last = float(stamp.read_text())
+        except (OSError, ValueError):
+            last = 0.0
+        wait = last + ARXIV_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        stamp.write_text(str(time.time()))
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _cached_lookup(kind: str, ident: str, fn) -> dict | None:
+    """Look up metadata once and cache it (also caching 'not found'). Network failures
+    raise LookupUnavailable and are not cached."""
+    f = meta_cache_dir() / (hashlib.sha1(f"{kind}:{ident.lower()}".encode()).hexdigest() + ".json")
+    if f.is_file():
+        data = json.loads(f.read_text(encoding="utf-8"))
+        return data.get("meta")
+    try:
+        meta = fn(ident)
+    except urllib.error.HTTPError as e:
+        raise LookupUnavailable(f"{kind} lookup for {ident} failed with HTTP {e.code}") from None
+    except (urllib.error.URLError, TimeoutError, ET.ParseError) as e:
+        raise LookupUnavailable(f"{kind} lookup for {ident} failed: {e}") from None
+    f.write_text(json.dumps({"kind": kind, "id": ident, "meta": meta, "checked": today()}), encoding="utf-8")
+    return meta
+
+
+def crossref_meta(doi: str) -> dict | None:
+    return _cached_lookup("doi", doi, _crossref_meta)
+
+
+def arxiv_meta(aid: str) -> dict | None:
+    return _cached_lookup("arxiv", aid, _arxiv_meta)
+
+
+def open_access_pdfs(doi: str) -> tuple[list[str], str | None]:
+    """Candidate open-access PDF URLs for a DOI, plus an arXiv ID if one is known."""
+    urls: list[str] = []
+    arxiv = None
+    try:
+        s2 = http_json(
+            "https://api.semanticscholar.org/graph/v1/paper/DOI:"
+            + urllib.parse.quote(doi) + "?fields=openAccessPdf,externalIds",
+            retries=2,
+        )
+        arxiv = (s2.get("externalIds") or {}).get("ArXiv")
+        if arxiv:
+            urls.append(f"https://arxiv.org/pdf/{arxiv}")
+        oa = (s2.get("openAccessPdf") or {}).get("url")
+        if oa:
+            urls.append(oa)
+    except Exception as e:  # noqa: BLE001
+        warn(f"Semantic Scholar lookup failed for {doi}: {e}")
+    email = os.environ.get("FORGE_EMAIL")
+    if email:
+        try:
+            up = http_json(f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi)}?email={urllib.parse.quote(email)}", retries=2)
+            for loc in [up.get("best_oa_location")] + (up.get("oa_locations") or []):
+                if loc and loc.get("url_for_pdf"):
+                    urls.append(loc["url_for_pdf"])
+        except Exception as e:  # noqa: BLE001
+            warn(f"Unpaywall lookup failed for {doi}: {e}")
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out, arxiv
+
+
+def download_pdf(url: str, dest: Path) -> bool:
+    try:
+        body, _ = http(url, headers={"Accept": "application/pdf"}, timeout=120, retries=2)
+    except Exception as e:  # noqa: BLE001
+        warn(f"download failed: {url}: {e}")
+        body = b""
+    if body.startswith(b"%PDF"):
+        dest.write_bytes(body)
+        return True
+    # Some publishers serve urllib an HTML interstitial but give curl the PDF.
+    if shutil.which("curl"):
+        tmp = dest.with_suffix(".part")
+        r = subprocess.run(
+            ["curl", "-sSL", "--max-time", "120", "-A", user_agent(), "-o", str(tmp), url],
+            capture_output=True,
+        )
+        if r.returncode == 0 and tmp.is_file() and tmp.read_bytes()[:4] == b"%PDF":
+            tmp.replace(dest)
+            return True
+        tmp.unlink(missing_ok=True)
+    return False
+
+
+# --------------------------------------------------------------------------- keys
+
+def surname_of(meta: dict) -> str:
+    fam = [f for f in meta.get("family") or [] if f]
+    if fam:
+        return fam[0]
+    authors = meta.get("authors") or []
+    if authors:
+        return authors[0].split()[-1]
+    return ""
+
+
+def make_key_base(meta: dict, fallback: str) -> str:
+    sur = re.sub(r"[^a-z]", "", ascii_fold(surname_of(meta)).lower())
+    year = str(meta.get("year") or "")
+    word = ""
+    for w in re.findall(r"[a-z0-9]+", ascii_fold(meta.get("title") or "").lower()):
+        if w not in STOPWORDS and not w.isdigit():
+            word = w
+            break
+    if sur and year and word:
+        return f"{sur}{year}{word}"
+    fb = re.sub(r"[^a-z0-9]+", "", ascii_fold(fallback).lower())
+    return fb or "paper"
+
+
+def unique_key(proj: Project, base: str, reserved: set[str]) -> str:
+    key, n = base, 0
+    while (proj.refs / key).exists() or key in reserved or key == "inbox":
+        n += 1
+        key = base + chr(ord("a") + n)  # b, c, d, ...
+    return key
+
+
+# --------------------------------------------------------------------------- OCR
+
+def cache_dir() -> Path:
+    d = Path(os.environ.get("FORGE_CACHE_DIR") or Path.home() / ".cache" / "forge" / "ocr")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+OCR_BACKENDS = ("marker", "mistral")
+MARKER_PAGE_RE = re.compile(r"\n*\{(\d+)\}-{48}\n*")
+
+
+def ocr_backend() -> str:
+    b = os.environ.get("FORGE_OCR_BACKEND", "marker").lower()
+    if b not in OCR_BACKENDS:
+        die(f"FORGE_OCR_BACKEND must be one of {', '.join(OCR_BACKENDS)}, not {b!r}")
+    return b
+
+
+def is_cached(sha: str) -> bool:
+    return any((cache_dir() / f"{sha}{suffix}").is_file() for suffix in (".json", ".marker.json"))
+
+
+def ocr_pdf(pdf: Path, sha: str) -> tuple[dict, bool]:
+    """Return (ocr_response, from_cache). Any backend's cached result is reused, so a
+    paper is never OCR'd twice; otherwise the configured backend runs."""
+    backend = ocr_backend()
+    names = {"mistral": f"{sha}.json", "marker": f"{sha}.marker.json"}
+    order = [backend] + [b for b in OCR_BACKENDS if b != backend]
+    for b in order:
+        cached = cache_dir() / names[b]
+        if cached.is_file():
+            return json.loads(cached.read_text(encoding="utf-8")), True
+    resp = _ocr_marker(pdf) if backend == "marker" else _ocr_mistral(pdf, sha)
+    if not resp.get("pages"):
+        raise RuntimeError(f"{backend} returned no pages")
+    cached = cache_dir() / names[backend]
+    tmp = cached.with_suffix(".tmp")
+    tmp.write_text(json.dumps(resp), encoding="utf-8")
+    tmp.replace(cached)
+    return resp, False
+
+
+def marker_url() -> str:
+    return os.environ.get("FORGE_MARKER_URL", "http://127.0.0.1:8001").rstrip("/")
+
+
+FORGE_HOME = Path(os.environ.get("FORGE_HOME") or Path.home() / ".local" / "share" / "forge")
+MARKER_BIN = FORGE_HOME / "marker-venv" / "bin" / "marker_server"
+MARKER_PID = FORGE_HOME / "marker.pid"
+MARKER_LOG = FORGE_HOME / "marker-server.log"
+
+
+def marker_state() -> str:
+    """'up', 'busy' (port open but no HTTP answer: Marker blocks while converting) or 'down'."""
+    u = urllib.parse.urlparse(marker_url())
+    try:
+        with socket.create_connection((u.hostname or "127.0.0.1", u.port or 8001), timeout=3):
+            pass
+    except OSError:
+        return "down"
+    try:
+        http(marker_url() + "/", timeout=5, retries=1)
+        return "up"
+    except Exception:  # noqa: BLE001
+        return "busy"
+
+
+def marker_up() -> bool:
+    return marker_state() != "down"
+
+
+def marker_start(wait: int = 300) -> None:
+    """Start the local Marker server in the background (it keeps running) and wait for it."""
+    if marker_up():
+        return
+    if not MARKER_BIN.is_file():
+        die(f"no Marker server at {marker_url()} and no Marker install at {MARKER_BIN}.\n"
+            "Install it (see the forge README) or set FORGE_OCR_BACKEND=mistral.")
+    port = urllib.parse.urlparse(marker_url()).port or 8001
+    run_dir = FORGE_HOME / "marker-run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_CHILD_SESSION"}
+    with MARKER_LOG.open("ab") as log:
+        proc = subprocess.Popen([str(MARKER_BIN), "--port", str(port)], cwd=run_dir, stdout=log, stderr=log,
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+    MARKER_PID.write_text(str(proc.pid))
+    info(f"starting the local Marker server (pid {proc.pid}); it keeps running until `refs marker stop`.")
+    for _ in range(wait):
+        if proc.poll() is not None:
+            die(f"the Marker server exited during start-up; see {MARKER_LOG}")
+        if marker_up():
+            info("Marker server is up.")
+            return
+        time.sleep(1)
+    die(f"the Marker server did not answer within {wait}s; see {MARKER_LOG}")
+
+
+def marker_stop() -> None:
+    import signal
+    try:
+        pid = int(MARKER_PID.read_text())
+    except (OSError, ValueError):
+        info("no Marker server started by refs (no pid file)." + (" One is running, started elsewhere." if marker_up() else ""))
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+        info(f"stopped the Marker server (pid {pid}).")
+    except ProcessLookupError:
+        info("the Marker server was not running.")
+    MARKER_PID.unlink(missing_ok=True)
+
+
+def cmd_marker(proj: Project, args) -> int:
+    if args.action == "start":
+        marker_start()
+    elif args.action == "stop":
+        marker_stop()
+    else:
+        info(ocr_status())
+    return 0
+
+
+def _ocr_marker(pdf: Path) -> dict:
+    """Convert with a self-hosted Marker server (marker_server --port 8001). Free, local.
+    The server is started automatically if it is installed but not running."""
+    base = marker_url()
+    marker_start()
+    payload = {
+        "filepath": str(pdf.resolve()),
+        "output_format": "markdown",
+        "paginate_output": True,
+        "mode": os.environ.get("FORGE_MARKER_MODE", "balanced"),
+    }
+    body, _ = http(base + "/marker", data=json.dumps(payload).encode(), timeout=3600, retries=1,
+                   headers={"Content-Type": "application/json", "Accept": "application/json"})
+    out = json.loads(body)
+    if not out.get("success"):
+        raise RuntimeError(f"Marker failed: {out.get('error')}")
+    return marker_to_pages(out)
+
+
+def marker_to_pages(out: dict) -> dict:
+    """Reshape Marker's single Markdown string into the per-page structure render_markdown uses."""
+    chunks = MARKER_PAGE_RE.split(out.get("output") or "")
+    pages: list[dict] = []
+    if chunks[0].strip():
+        pages.append({"index": 0, "markdown": chunks[0]})
+    for i in range(1, len(chunks), 2):
+        pages.append({"index": int(chunks[i]), "markdown": chunks[i + 1]})
+    if not pages:
+        pages = [{"index": 0, "markdown": out.get("output") or ""}]
+    for p in pages:
+        p["images"] = []
+    for name, b64 in (out.get("images") or {}).items():
+        home = next((p for p in pages if f"({name})" in p["markdown"]), pages[0])
+        home["images"].append({"id": name, "image_base64": b64})
+    return {"backend": "marker", "pages": pages, "metadata": out.get("metadata")}
+
+
+def _ocr_mistral(pdf: Path, sha: str) -> dict:
+    key = os.environ.get("MISTRAL_API_KEY")
+    if not key:
+        die("MISTRAL_API_KEY is not set; it is needed for FORGE_OCR_BACKEND=mistral.")
+    size = pdf.stat().st_size
+    if size > 45 * 1024 * 1024:
+        raise RuntimeError(f"{pdf.name} is {size // 2**20} MB; Mistral OCR accepts at most ~50 MB per document")
+    # Same route as the Obsidian marker-api plugin: upload, sign a URL, OCR the URL.
+    # Sending the PDF inline as base64 gets rate-limited on the free tier.
+    auth = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    try:
+        boundary = "forge" + hashlib.sha1(sha.encode()).hexdigest()
+        parts = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nocr\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{sha[:16]}.pdf\"\r\n"
+            "Content-Type: application/pdf\r\n\r\n"
+        ).encode() + pdf.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        up, _ = http(f"{MISTRAL_API}/files", data=parts, timeout=300, retries=5,
+                     headers={**auth, "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        file_id = json.loads(up)["id"]
+        try:
+            signed = json.loads(http(f"{MISTRAL_API}/files/{file_id}/url?expiry=1", headers=auth, retries=5)[0])["url"]
+            payload = {
+                "model": os.environ.get("MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
+                "document": {"type": "document_url", "document_url": signed},
+                "include_image_base64": True,
+            }
+            body, _ = http(f"{MISTRAL_API}/ocr", data=json.dumps(payload).encode(), timeout=600, retries=5,
+                           headers={**auth, "Content-Type": "application/json"})
+        finally:
+            try:
+                http(f"{MISTRAL_API}/files/{file_id}", headers=auth, method="DELETE", retries=2)
+            except Exception as e:  # noqa: BLE001
+                warn(f"could not delete uploaded file {file_id} from Mistral: {e}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"Mistral returned HTTP {e.code} for {e.url}: {detail}") from None
+    return json.loads(body)
+
+
+MD_LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)")
+
+
+def render_markdown(resp: dict, images_dir: Path) -> str:
+    """Join OCR pages into one Markdown body, save images, inline tables."""
+    images_dir.mkdir(parents=True, exist_ok=True)
+    used: set[str] = set()
+    parts = []
+    for page in resp["pages"]:
+        idx = page.get("index", len(parts))
+        text = page.get("markdown") or ""
+        img_map: dict[str, str] = {}
+        for img in page.get("images") or []:
+            iid = img.get("id")
+            data = img.get("image_base64")
+            if not iid:
+                continue
+            name = iid if iid not in used else f"p{idx + 1}-{iid}"
+            used.add(name)
+            img_map[iid] = name
+            if data:
+                if data.startswith("data:"):
+                    data = data.split(",", 1)[1]
+                (images_dir / name).write_bytes(base64.b64decode(data))
+        tables = {}
+        for t in page.get("tables") or []:
+            tid = t.get("id")
+            content = t.get("content") or t.get("markdown") or t.get("html")
+            if tid and content:
+                tables[tid] = content.strip()
+
+        def repl(m: re.Match) -> str:
+            bang, label, target = m.groups()
+            if target in img_map:
+                return f"![[images/{img_map[target]}]]"
+            if target in tables:
+                return "\n" + tables[target] + "\n"
+            return m.group(0)
+
+        text = MD_LINK_RE.sub(repl, text)
+        parts.append(f"<!-- page {idx + 1} -->\n\n{text.strip()}\n")
+    return "\n".join(parts)
+
+
+def strip_images(resp: dict) -> dict:
+    out = json.loads(json.dumps(resp))
+    for page in out.get("pages", []):
+        for img in page.get("images") or []:
+            img.pop("image_base64", None)
+    return out
+
+
+def first_heading(md: str) -> str | None:
+    for line in md.splitlines():
+        m = re.match(r"^#{1,2}\s+(.+?)\s*#*\s*$", line)
+        if m:
+            title = re.sub(r"[*_`$\\]", "", m.group(1)).strip()
+            if len(title) > 10 and not re.match(r"(?i)^(abstract|contents|introduction)$", title):
+                return title
+    return None
+
+
+def metadata_for_dropin(resp: dict, pdf: Path) -> dict:
+    """Identify a PDF that arrived without a sidecar: DOI → arXiv ID → title search → unverified."""
+    p0 = resp["pages"][0] if resp.get("pages") else {}
+    first = "\n".join(p0.get(f) or "" for f in ("header", "markdown", "footer"))
+    for m in DOI_RE.finditer(first):
+        kind, val = classify(m.group(1))
+        try:
+            meta = arxiv_meta(val) if kind == "arxiv" else crossref_meta(val)
+        except Exception as e:  # noqa: BLE001
+            warn(f"lookup failed for {val}: {e}")
+            meta = None
+        if meta:
+            meta["verified"] = True
+            return meta
+    m = re.search(r"arXiv:\s*(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})", first)
+    if m:
+        try:
+            meta = arxiv_meta(m.group(1))
+        except Exception as e:  # noqa: BLE001
+            warn(f"arXiv lookup failed for {m.group(1)}: {e}")
+            meta = None
+        if meta:
+            meta["verified"] = True
+            return meta
+    title = first_heading(p0.get("markdown") or "")
+    if title:
+        meta = crossref_search_title(title)
+        if meta:
+            meta["verified"] = True
+            return meta
+    return {
+        "title": title or pdf.stem, "authors": [], "family": [], "year": None,
+        "doi": None, "arxiv": None, "url": None, "verified": False,
+    }
+
+
+
+# --------------------------------------------------------------------------- paper pool
+
+CONFIG_FILE = Path(os.environ.get("FORGE_CONFIG") or Path.home() / ".config" / "forge" / "config.json")
+POOL_FOLDER_RE = re.compile(r"^(?P<authors>.+?) - (?P<year>\d{4}) - (?P<title>.+)$")
+POOL_IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+
+
+def read_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_config(cfg: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
+
+
+def pool_roots() -> list[Path]:
+    env = os.environ.get("FORGE_POOL")
+    roots = env.split(os.pathsep) if env else read_config().get("pools", [])
+    return [Path(r).expanduser() for r in roots if r and Path(r).expanduser().is_dir()]
+
+
+def _pool_entry(folder: Path) -> dict | None:
+    """A pool paper is a folder holding exactly one Markdown file (plus assets)."""
+    mds = [p for p in folder.glob("*.md") if p.is_file()]
+    if len(mds) != 1:
+        return None
+    md = mds[0]
+    try:
+        head = md.read_text(encoding="utf-8", errors="replace")[:6000]
+    except OSError:
+        return None
+    m = POOL_FOLDER_RE.match(folder.name)
+    title = m.group("title") if m else None
+    if not title:
+        h = re.search(r"(?m)^#\s+(.+)$", head)
+        title = h.group(1).strip() if h else folder.name
+    arxiv = re.search(r"arXiv:\s*(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})", head[:600])
+    doi = DOI_RE.search(head[:3000])
+    return {
+        "path": str(folder), "md": md.name, "title": title,
+        "year": int(m.group("year")) if m else None,
+        "arxiv": arxiv.group(1).lower() if arxiv else None,
+        "doi": clean_doi(doi.group(1)) if doi else None,
+        "mtime": md.stat().st_mtime,
+    }
+
+
+def pool_index(refresh: bool = False) -> list[dict]:
+    """All papers in the configured pools, cached and refreshed when a folder changes."""
+    cache_f = Path.home() / ".cache" / "forge" / "pool-index.json"
+    try:
+        cache = {} if refresh else json.loads(cache_f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    entries, fresh = [], {}
+    for root in pool_roots():
+        for md in root.rglob("*.md"):
+            folder = md.parent
+            if folder == root or ".obsidian" in folder.parts or str(folder) in fresh:
+                continue
+            key = str(folder)
+            old = cache.get(key)
+            if old and old.get("mtime") == md.stat().st_mtime:
+                fresh[key] = old
+            else:
+                e = _pool_entry(folder)
+                if e:
+                    fresh[key] = e
+    entries = list(fresh.values())
+    cache_f.parent.mkdir(parents=True, exist_ok=True)
+    cache_f.write_text(json.dumps(fresh), encoding="utf-8")
+    return entries
+
+
+def pool_match(meta: dict, entries: list[dict] | None = None) -> dict | None:
+    entries = pool_index() if entries is None else entries
+    doi, arxiv = (meta.get("doi") or "").lower(), (meta.get("arxiv") or "").lower()
+    for e in entries:
+        if (doi and e.get("doi") == doi) or (arxiv and e.get("arxiv") == arxiv):
+            return e
+    want = norm_title(meta.get("title") or "")
+    if len(want) < 12:
+        return None
+    best, score = None, 0.0
+    for e in entries:
+        got = norm_title(e.get("title") or "")
+        r = difflib.SequenceMatcher(None, want, got).ratio()
+        if r > score:
+            best, score = e, r
+    if best and score >= 0.92 and (not meta.get("year") or not best.get("year") or abs(best["year"] - meta["year"]) <= 1):
+        return best
+    return None
+
+
+def copy_from_pool(proj: Project, entry: dict, meta: dict, source: str, reserved: set[str]) -> str:
+    """Copy a pooled paper into references/<key>/ in forge's layout. Returns the key."""
+    folder = Path(entry["path"])
+    key = unique_key(proj, make_key_base(meta, folder.name), reserved)
+    dest = proj.refs / key
+    tmp = proj.refs / f".{key}.partial"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    (tmp / "images").mkdir(parents=True)
+    text = (folder / entry["md"]).read_text(encoding="utf-8", errors="replace")
+
+    def img(m: re.Match) -> str:
+        target = urllib.parse.unquote(m.group(2))
+        src = (folder / target).resolve()
+        if src.is_file() and str(src).startswith(str(folder.resolve())):
+            name = src.name
+            shutil.copy2(src, tmp / "images" / name)
+            return f"![[images/{name}]]"
+        return m.group(0)
+
+    body = POOL_IMG_RE.sub(img, text)
+    fm = {
+        "key": key, "title": meta.get("title"), "authors": meta.get("authors") or [], "year": meta.get("year"),
+        "doi": meta.get("doi"), "arxiv": meta.get("arxiv"), "url": meta.get("url"), "source": source,
+        "verified": True, "converted": today(), "ocr_sha256": None, "origin": f"pool: {folder}",
+    }
+    (tmp / f"{key}.md").write_text(dump_frontmatter(fm) + "\n" + body, encoding="utf-8")
+    for pdf in folder.glob("*.pdf"):
+        shutil.copy2(pdf, tmp / f"{key}.pdf")
+        break
+    tmp.rename(dest)
+    return key
+
+
+def cmd_pool(proj: Project, args) -> int:
+    cfg = read_config()
+    if args.action == "add":
+        path = str(Path(args.arg).expanduser().resolve())
+        if not Path(path).is_dir():
+            die(f"{path} is not a folder")
+        cfg["pools"] = sorted(set(cfg.get("pools", [])) | {path})
+        write_config(cfg)
+        info(f"pool added: {path} ({len([e for e in pool_index(refresh=True) if e['path'].startswith(path)])} papers)")
+    elif args.action == "remove":
+        path = str(Path(args.arg).expanduser().resolve())
+        cfg["pools"] = [p for p in cfg.get("pools", []) if p != path]
+        write_config(cfg)
+        info(f"pool removed: {path}")
+    elif args.action == "list":
+        entries = pool_index(refresh=True)
+        roots = pool_roots()
+        if not roots:
+            info("no pool configured. Add one with: refs pool add <folder>")
+        for r in roots:
+            n = sum(1 for e in entries if e["path"].startswith(str(r)))
+            info(f"{r}  ({n} papers)")
+        for e in sorted(entries, key=lambda e: e["path"]):
+            ids = ", ".join(x for x in (e.get("arxiv") and f"arXiv:{e['arxiv']}", e.get("doi") and f"doi:{e['doi']}") if x)
+            info(f"  - {e['title'][:80]}" + (f"  [{ids}]" if ids else ""))
+    elif args.action == "find":
+        words = norm_title(args.arg or "").split()
+        hits = [e for e in pool_index() if all(w in norm_title(e["title"]) for w in words)]
+        for e in hits:
+            info(f"{e['title']}  ->  {e['path']}")
+        if not hits:
+            info("no pool paper matches.")
+    return 0
+
+# --------------------------------------------------------------------------- commands
+
+def cmd_convert(proj: Project, args) -> int:
+    proj.ensure()
+    pdfs = proj.inbox_pdfs()
+    if not pdfs:
+        info("inbox is empty; nothing to convert.")
+        return 0
+    by_sha = {m.get("ocr_sha256"): d for d, m in proj.papers() if m.get("ocr_sha256")}
+    reserved: set[str] = set()
+    done_ids: set[str] = set()
+    failures = 0
+    api_calls = 0
+    started = time.time()
+    deferred = 0
+    for pdf in pdfs:
+        sidecar = pdf.with_name(pdf.stem + ".meta.json")
+        sha = sha256_file(pdf)
+        if sha in by_sha:
+            info(f"skip  {pdf.name}: identical to {by_sha[sha].name}/, removing duplicate from inbox")
+            pdf.unlink()
+            sidecar.unlink(missing_ok=True)
+            continue
+        if not is_cached(sha) and time.time() - started > args.budget:
+            deferred += 1
+            continue
+        try:
+            resp, hit = ocr_pdf(pdf, sha)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            warn(f"{pdf.name}: {e}")
+            continue
+        api_calls += 0 if hit else 1
+        side = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
+        if side and not side.get("resolve"):
+            meta = side
+        else:
+            meta = metadata_for_dropin(resp, pdf)
+            meta["source"] = side.get("source", "user")
+            meta["url"] = meta.get("url") or side.get("url")
+        key = unique_key(proj, make_key_base(meta, pdf.stem), reserved)
+        reserved.add(key)
+        folder = proj.refs / key
+        tmp = proj.refs / f".{key}.partial"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        try:
+            body = render_markdown(resp, tmp / "images")
+            fm = {
+                "key": key,
+                "title": meta.get("title"),
+                "authors": meta.get("authors") or [],
+                "year": meta.get("year"),
+                "doi": meta.get("doi"),
+                "arxiv": meta.get("arxiv"),
+                "url": meta.get("url"),
+                "source": meta.get("source") or "user",
+                "verified": bool(meta.get("verified")),
+                "converted": today(),
+                "ocr_sha256": sha,
+            }
+            (tmp / f"{key}.md").write_text(dump_frontmatter(fm) + "\n" + body, encoding="utf-8")
+            (tmp / "ocr.json").write_text(json.dumps(strip_images(resp), indent=1), encoding="utf-8")
+            shutil.move(str(pdf), str(tmp / f"{key}.pdf"))
+            tmp.rename(folder)
+        except Exception:
+            if (tmp / f"{key}.pdf").exists() and not pdf.exists():
+                shutil.move(str(tmp / f"{key}.pdf"), str(pdf))
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        sidecar.unlink(missing_ok=True)
+        by_sha[sha] = folder
+        for f in ("doi", "arxiv"):
+            if fm[f]:
+                done_ids.add(str(fm[f]).lower())
+        pages = len(resp.get("pages", []))
+        flag = "" if fm["verified"] else "  (unverified metadata)"
+        info(f"{'cache' if hit else 'ocr  '} {pdf.name} -> {key}/  [{pages} pages]{flag}")
+    if done_ids:
+        drop_missing(proj, done_ids)
+    write_catalog(proj)
+    write_bib(proj)
+    info(f"converted with {api_calls} OCR call(s); {failures} failure(s).")
+    waiting = len(proj.inbox_pdfs())
+    if deferred:
+        info(f"stopped after the {args.budget}s budget: {deferred} PDF(s) not started. Run `refs convert` again.")
+    info(f"inbox: {waiting} PDF(s) still waiting.")
+    return 1 if failures else (3 if waiting else 0)
+
+
+def cmd_fetch(proj: Project, args) -> int:
+    proj.ensure()
+    known = proj.known_ids()
+    missing_ids = {r[0].lower() for r in read_missing(proj)}
+    stats = {"from pool": 0, "downloaded": 0, "known": 0, "missing": 0, "dropped": 0}
+    pooled = False
+    for raw in args.ids:
+        kind, val = classify(raw)
+        try:
+            if kind == "arxiv":
+                meta = arxiv_meta(val)
+            elif kind == "doi":
+                meta = crossref_meta(val)
+            elif kind == "url":
+                meta = None
+            else:
+                meta = None
+        except Exception as e:  # noqa: BLE001
+            warn(f"{raw}: lookup failed: {e}")
+            proj.write_log(f"DROPPED {raw}: lookup failed: {e}")
+            stats["dropped"] += 1
+            continue
+
+        if kind == "url":
+            name = re.sub(r"[^A-Za-z0-9._-]+", "_", urllib.parse.urlparse(val).path.rsplit("/", 1)[-1] or "download")
+            name = name if name.lower().endswith(".pdf") else name + ".pdf"
+            dest = proj.inbox / name
+            if download_pdf(val, dest):
+                # metadata is resolved at convert time, from the DOI or title in the OCR text
+                side = {"url": val, "source": args.source, "resolve": True}
+                dest.with_name(dest.stem + ".meta.json").write_text(json.dumps(side), encoding="utf-8")
+                info(f"got   {raw} -> inbox/{name} (metadata resolved at convert)")
+                proj.write_log(f"FETCHED {raw} -> inbox/{name} (unresolved URL)")
+                stats["downloaded"] += 1
+            else:
+                add_missing(proj, val, "", "URL did not return a PDF")
+                proj.write_log(f"MISSING {raw}: URL did not return a PDF")
+                stats["missing"] += 1
+            continue
+
+        if not meta:
+            warn(f"{raw}: does not resolve via Crossref or arXiv; dropped")
+            proj.write_log(f"DROPPED {raw}: unresolved ({kind})")
+            stats["dropped"] += 1
+            continue
+
+        ident = meta.get("arxiv") or meta.get("doi")
+        if {str(meta.get("doi") or "").lower(), str(meta.get("arxiv") or "").lower()} & known:
+            info(f"have  {raw} ({meta['title'][:60]})")
+            stats["known"] += 1
+            continue
+
+        # The paper pool first: an already-converted copy costs no download and no OCR.
+        hit = pool_match(meta) if pool_roots() else None
+        if hit:
+            key = copy_from_pool(proj, hit, meta, args.source, set())
+            known.update(x.lower() for x in (meta.get("doi"), meta.get("arxiv")) if x)
+            if ident.lower() in missing_ids:
+                drop_missing(proj, {ident.lower()})
+            info(f"pool  {raw} -> {key}/ (from {Path(hit['path']).name})")
+            proj.write_log(f"POOL {raw} -> references/{key}/ from {hit['path']}")
+            stats["from pool"] = stats.get("from pool", 0) + 1
+            pooled = True
+            continue
+
+        candidates = list(meta.get("_pdf_links") or [])
+        if kind == "doi":
+            oa, arxiv = open_access_pdfs(meta["doi"])
+            if arxiv:
+                meta["arxiv"] = arxiv
+            candidates = oa + candidates
+
+        base = make_key_base(meta, ident)
+        dest = proj.inbox / f"{base}.pdf"
+        n = 0
+        while dest.exists():
+            n += 1
+            dest = proj.inbox / f"{base}-{n}.pdf"
+        ok = any(download_pdf(u, dest) for u in candidates)
+        if ok:
+            side = {k: v for k, v in meta.items() if not k.startswith("_")}
+            side.update(source=args.source, verified=True)
+            dest.with_name(dest.stem + ".meta.json").write_text(json.dumps(side, indent=1), encoding="utf-8")
+            known.update(x.lower() for x in (meta.get("doi"), meta.get("arxiv")) if x)
+            info(f"got   {raw} -> inbox/{dest.name} ({meta['title'][:60]})")
+            proj.write_log(f"FETCHED {raw} -> inbox/{dest.name}")
+            stats["downloaded"] += 1
+        else:
+            if ident.lower() not in missing_ids:
+                add_missing(proj, ident, meta["title"], "no open-access PDF found")
+                missing_ids.add(ident.lower())
+            info(f"miss  {raw} ({meta['title'][:60]}) -> MISSING.md")
+            proj.write_log(f"MISSING {raw}: no open-access PDF")
+            stats["missing"] += 1
+        time.sleep(0.5)  # be polite to the metadata APIs
+    if pooled:
+        write_catalog(proj)
+        write_bib(proj)
+    info(", ".join(f"{v} {k}" for k, v in stats.items()))
+    return 0
+
+
+def cmd_resolve(proj: Project, args) -> int:
+    """Check IDs against Crossref / arXiv without downloading anything. Prints JSON."""
+    known = proj.known_ids() if proj.refs.is_dir() else set()
+    out = []
+    for raw in args.ids:
+        kind, val = classify(raw)
+        rec = {"input": raw, "resolved": False, "kind": kind}
+        try:
+            meta = arxiv_meta(val) if kind == "arxiv" else crossref_meta(val) if kind == "doi" else None
+        except LookupUnavailable as e:
+            meta, rec["error"], rec["retry"] = None, f"could not check now ({e}); retry later", True
+        except Exception as e:  # noqa: BLE001
+            meta, rec["error"] = None, str(e)[:200]
+        if meta:
+            ident = meta.get("arxiv") or meta.get("doi")
+            authors = meta.get("authors") or []
+            rec.update(resolved=True, id=ident, title=meta.get("title"), year=meta.get("year"),
+                       first_author=authors[0] if authors else None, doi=meta.get("doi"), arxiv=meta.get("arxiv"),
+                       in_project=bool({str(meta.get("doi") or "").lower(), str(meta.get("arxiv") or "").lower()} & known))
+        elif kind == "url":
+            rec["error"] = "URLs are not resolved; give a DOI or arXiv ID"
+        elif "error" not in rec:
+            rec["error"] = "not found in Crossref or arXiv"
+        out.append(rec)
+    print(json.dumps(out, indent=1, ensure_ascii=False))
+    return 0 if all(r["resolved"] for r in out) else 1
+
+
+def write_catalog(proj: Project) -> None:
+    proj.refs.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for d, m in proj.papers():
+        authors = m.get("authors") or []
+        who = (authors[0].split()[-1] if authors else "?") + (" et al." if len(authors) > 1 else "")
+        ident = (f"doi:{m['doi']}" if m.get("doi") else "") or (f"arXiv:{m['arxiv']}" if m.get("arxiv") else "") or (m.get("url") or "")
+        title = (m.get("title") or "").replace("|", "/")
+        rows.append(
+            f"| [[{d.name}/{d.name}\\|{d.name}]] | {m.get('year') or ''} | {title} | {who} | {ident} | "
+            f"{m.get('source') or ''} | {'yes' if m.get('verified') else 'no'} |"
+        )
+    text = (
+        "# Catalog\n\nGenerated by `refs catalog`; do not edit by hand.\n\n"
+        "| key | year | title | first author | id | source | verified |\n"
+        "|---|---|---|---|---|---|---|\n" + "\n".join(rows) + ("\n" if rows else "")
+    )
+    proj.catalog.write_text(text, encoding="utf-8")
+
+
+def bib_escape(s: str) -> str:
+    s = s.replace("\\", "\\textbackslash{}")
+    for ch in "&%$#_":
+        s = s.replace(ch, "\\" + ch)
+    return s.replace("{", "\\{").replace("}", "\\}")
+
+
+def write_bib(proj: Project) -> None:
+    proj.refs.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for d, m in proj.papers():
+        kind = "article" if m.get("doi") else "misc"
+        fields = [("title", "{" + bib_escape(m.get("title") or "") + "}")]
+        if m.get("authors"):
+            fields.append(("author", " and ".join(bib_escape(a) for a in m["authors"])))
+        if m.get("year"):
+            fields.append(("year", str(m["year"])))
+        if m.get("doi"):
+            fields.append(("doi", m["doi"]))
+        if m.get("arxiv"):
+            fields += [("eprint", m["arxiv"]), ("archivePrefix", "arXiv")]
+        if m.get("url"):
+            fields.append(("url", m["url"]))
+        body = ",\n".join(f"  {k} = {{{v}}}" for k, v in fields)
+        entries.append(f"@{kind}{{{d.name},\n{body}\n}}\n")
+    proj.bib.write_text("\n".join(entries), encoding="utf-8")
+
+
+def cmd_catalog(proj: Project, args) -> int:
+    write_catalog(proj)
+    info(f"wrote {proj.catalog.relative_to(proj.root)} ({len(proj.papers())} papers)")
+    return 0
+
+
+def cmd_bib(proj: Project, args) -> int:
+    write_bib(proj)
+    info(f"wrote {proj.bib.relative_to(proj.root)} ({len(proj.papers())} entries)")
+    return 0
+
+
+def cmd_status(proj: Project, args) -> int:
+    if not proj.refs.is_dir():
+        info(f"no references/ folder under {proj.root}")
+        info(ocr_status())
+        return 0
+    papers = proj.papers()
+    unverified = [d.name for d, m in papers if not m.get("verified")]
+    inbox = proj.inbox_pdfs()
+    if getattr(args, "json", False):
+        print(json.dumps({"converted": len(papers), "keys": [d.name for d, _ in papers],
+                          "inbox_waiting": len(inbox), "inbox_files": [p.name for p in inbox],
+                          "missing": len(read_missing(proj)), "unverified": unverified,
+                          "ocr": ocr_status().split(":", 1)[1].strip()}, indent=1))
+        return 0
+    cached = sum(1 for p in inbox if is_cached(sha256_file(p)))
+    missing = read_missing(proj)
+    info(f"project:    {proj.root}")
+    info(f"converted:  {len(papers)}" + (f" ({len(unverified)} unverified: {', '.join(unverified)})" if unverified else ""))
+    info(f"inbox:      {len(inbox)} PDF(s) waiting" + (f", {cached} already in OCR cache" if inbox else ""))
+    info(f"missing:    {len(missing)}")
+    info(ocr_status())
+    return 0
+
+
+def ocr_status() -> str:
+    backend = ocr_backend()
+    if backend == "marker":
+        st = marker_state()
+        state = {"up": f"server up at {marker_url()}",
+                 "busy": f"server running at {marker_url()}, busy converting",
+                 "down": f"server not running at {marker_url()}; `refs convert` starts it"}[st]
+    else:
+        state = "api key " + ("set" if os.environ.get("MISTRAL_API_KEY") else "NOT set")
+    return f"ocr:        {backend} ({state})"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="refs", description="Manage a forge project's references/ folder.")
+    ap.add_argument("--root", help="project root (default: nearest ancestor with references/, else cwd)")
+    ap.add_argument("--version", action="version", version=f"refs {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    cv = sub.add_parser("convert", help="OCR PDFs in references/inbox/")
+    cv.add_argument("--budget", type=int, default=300, metavar="SECONDS",
+                    help="don't start a new uncached PDF after this many seconds (default 300); run again for the rest")
+    f = sub.add_parser("fetch", help="resolve IDs and download open-access PDFs")
+    f.add_argument("ids", nargs="+", metavar="ID", help="DOI, arXiv ID, or URL")
+    f.add_argument("--source", choices=SOURCES, default="user", help="who asked for these papers")
+    rs = sub.add_parser("resolve", help="check DOIs / arXiv IDs exist (no download); prints JSON")
+    rs.add_argument("ids", nargs="+", metavar="ID")
+    sub.add_parser("catalog", help="rebuild references/catalog.md")
+    sub.add_parser("bib", help="rebuild references/references.bib")
+    st = sub.add_parser("status", help="counts of converted, waiting and missing papers")
+    st.add_argument("--json", action="store_true", help="machine-readable output")
+    pl = sub.add_parser("pool", help="manage the paper pool (already-converted papers reused by fetch)")
+    pl.add_argument("action", choices=("add", "remove", "list", "find"))
+    pl.add_argument("arg", nargs="?", default="", help="folder for add/remove, words for find")
+    mk = sub.add_parser("marker", help="start, stop or check the local Marker OCR server")
+    mk.add_argument("action", choices=("start", "stop", "status"))
+    args = ap.parse_args(argv)
+    proj = Project.find(args.root)
+    handler = {"convert": cmd_convert, "fetch": cmd_fetch, "catalog": cmd_catalog,
+               "bib": cmd_bib, "status": cmd_status, "marker": cmd_marker,
+               "resolve": cmd_resolve, "pool": cmd_pool}[args.cmd]
+    try:
+        return handler(proj, args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

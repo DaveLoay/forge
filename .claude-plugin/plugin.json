@@ -1,0 +1,6 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "Research-to-code pipeline: interrogate, investigate, plan with a critic council, build against locked tests.",
+  "author": { "name": "DaveLoay" }
+}

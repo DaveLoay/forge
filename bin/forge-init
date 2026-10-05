@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""forge-init: turn a folder into a forge project.
+
+  forge-init [DIR]     (default: current directory)
+
+Creates references/ (inbox, catalog, bib, MISSING.md), pipeline/, tests/, src/
+and a .gitignore. Safe to re-run: existing files are never overwritten, and the
+forge block is added to an existing .gitignore only once.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+TEMPLATES = PLUGIN_ROOT / "templates"
+GITIGNORE_MARK = "# >>> forge >>>"
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 1 or (argv and argv[0] in ("-h", "--help")):
+        print(__doc__.strip())
+        return 0 if argv and argv[0] in ("-h", "--help") else 2
+    root = Path(argv[0] if argv else ".").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    made: list[str] = []
+
+    def mkdir(rel: str, keep: bool = True) -> None:
+        d = root / rel
+        if not d.is_dir():
+            d.mkdir(parents=True)
+            made.append(rel + "/")
+        if keep and not any(d.iterdir()):
+            (d / ".gitkeep").touch()
+
+    def write(rel: str, text: str) -> None:
+        p = root / rel
+        if not p.exists():
+            p.write_text(text, encoding="utf-8")
+            made.append(rel)
+
+    mkdir("references/inbox", keep=False)  # gitignored anyway
+    mkdir("pipeline")
+    mkdir("tests")
+    mkdir("src")
+
+    # Empty catalog, bib and MISSING.md, written by refs itself so the formats match.
+    refs = PLUGIN_ROOT / "bin" / "refs"
+    for cmd, rel in (("catalog", "references/catalog.md"), ("bib", "references/references.bib")):
+        if not (root / rel).exists():
+            subprocess.run([sys.executable, str(refs), "--root", str(root), cmd],
+                           check=True, stdout=subprocess.DEVNULL)
+            made.append(rel)
+    write("references/MISSING.md",
+          "# Missing papers\n\n"
+          "Paywalled or otherwise unavailable. Get the PDF, drop it into `inbox/`, then run `refs convert`.\n\n"
+          "| id | title | reason |\n|---|---|---|\n")
+
+    block = (TEMPLATES / "project.gitignore").read_text(encoding="utf-8")
+    gi = root / ".gitignore"
+    if not gi.exists():
+        gi.write_text(block, encoding="utf-8")
+        made.append(".gitignore")
+    elif GITIGNORE_MARK not in gi.read_text(encoding="utf-8"):
+        existing = gi.read_text(encoding="utf-8")
+        gi.write_text(existing.rstrip("\n") + "\n\n" + block, encoding="utf-8")
+        made.append(".gitignore (forge block appended)")
+
+    if made:
+        print(f"forge project initialised in {root}")
+        for m in made:
+            print(f"  + {m}")
+    else:
+        print(f"{root} is already a forge project; nothing to do.")
+    print("Next: the interrogator session writes pipeline/brief.md (see /forge:status for the command).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

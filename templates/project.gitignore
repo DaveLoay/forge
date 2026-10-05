@@ -1,0 +1,14 @@
+# >>> forge >>>
+# Paper folders, PDFs and the inbox stay local. catalog.md, references.bib and
+# MISSING.md are committed so the references can be rebuilt on another machine.
+references/*
+!references/catalog.md
+!references/references.bib
+!references/MISSING.md
+
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+# <<< forge <<<

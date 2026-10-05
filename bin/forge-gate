@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""forge-gate GATE: check that a gate's approval is still valid. Exit 0 if so, 1 if not.
+
+Prints one line starting with OK or BLOCKED. Read-only.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import forge_approvals as fa  # noqa: E402
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        print(f"usage: forge-gate GATE   ({fa.known_gates()})")
+        return 2
+    here = Path.cwd().resolve()
+    root = next((d for d in [here, *here.parents] if (d / "pipeline").is_dir() and (d / "references").is_dir()), None)
+    if root is None:
+        print("BLOCKED: not inside a forge project")
+        return 1
+    ok, why = fa.check(root, sys.argv[1].strip().lower())
+    print(("OK: " if ok else "BLOCKED: ") + why)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

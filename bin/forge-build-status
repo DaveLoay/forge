@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""forge-build-status [--json]: where the build stands, read from files only.
+
+Reports the design approval, the test lock, and for each slice in plan.md: its
+checkpoint commands, its last forge-test record, whether its report exists, whether
+it is approved, and which files changed compared with the previous slice. Also names
+the next slice to build. Read-only.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+import forge_approvals as fa  # noqa: E402
+import forge_build as fb  # noqa: E402
+
+
+def status(root: Path) -> dict:
+    design_ok, design_reason = fa.check(root, "design")
+    locked, intact, lock_reason = fa.tests_lock_state(root)
+    plan = root / "pipeline" / "plan.md"
+    slices = fb.parse_slices(plan.read_text(encoding="utf-8")) if plan.is_file() else []
+    out_slices, prev_files, nxt = [], {}, None
+    for s in slices:
+        n = s["n"]
+        rec = fb.test_record(root, n)
+        approved, why = fa.check(root, f"slice-{n}")
+        files = rec.get("files", {}) if rec else {}
+        out_slices.append({
+            "n": n, "name": s["name"], "commands": s["commands"],
+            "tests": None if not rec else {
+                "passed": rec.get("passed"), "ran_at": rec.get("ran_at"), "reason": rec.get("reason"),
+                "commands": [{"command": c["command"], "exit": c["exit"]} for c in rec.get("commands", [])],
+                "tail": (rec.get("commands") or [{}])[-1].get("tail", ""),
+            },
+            "report": (root / "pipeline" / "slices" / f"slice-{n}.md").is_file(),
+            "approved": approved,
+            "approval": why,
+            "changes": fb.diff_snapshots(prev_files, files) if rec else None,
+        })
+        if rec:
+            prev_files = files
+        if nxt is None and not approved:
+            nxt = n
+    return {
+        "design_ok": design_ok, "design": design_reason,
+        "tests_locked": locked, "tests_intact": intact, "tests_lock": lock_reason,
+        "slices": out_slices, "next": nxt,
+        "all_approved": bool(slices) and nxt is None,
+        "review_exists": (root / "pipeline" / "review.md").is_file(),
+    }
+
+
+def main(argv: list[str]) -> int:
+    root = fb.find_root()
+    if root is None:
+        print("not inside a forge project")
+        return 1
+    st = status(root)
+    if "--json" in argv:
+        print(json.dumps(st, indent=1))
+        return 0
+    print(f"design: {'OK' if st['design_ok'] else 'NOT approved'} ({st['design']})")
+    print(f"tests:  {st['tests_lock']}")
+    for s in st["slices"]:
+        t = s["tests"]
+        state = "approved" if s["approved"] else ("passed, awaiting approval" if t and t["passed"]
+                                                  else "failed" if t else "not built")
+        print(f"slice {s['n']}: {state}: {s['name']}")
+    print(f"next:   {'slice ' + str(st['next']) if st['next'] else 'all slices approved'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
