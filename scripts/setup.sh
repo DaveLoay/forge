@@ -68,7 +68,10 @@ if [ "$GPU" = 1 ]; then
     # (error 804, "forward compatibility ... on non supported HW", on GeForce cards).
     DRV_CUDA="$(nvidia-smi | sed -n 's/.*CUDA Version: *\([0-9][0-9]*\.[0-9]*\).*/\1/p' | head -1)"
     IMG="$("$VENV/bin/python" -c 'from surya.settings import settings; print(settings.VLLM_DOCKER_IMAGE)' 2>/dev/null)"
-    if [ -n "$DRV_CUDA" ] && [ -n "$IMG" ] && [ "${DRV_CUDA%%.*}" -lt 13 ] && ! echo "$IMG" | grep -q -- '-cu'; then
+    SET_IMG="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.config/forge/config.json"))).get("marker_env",{}).get("VLLM_DOCKER_IMAGE",""))' 2>/dev/null)"
+    if [ -n "$SET_IMG" ]; then
+      ok "Marker uses $SET_IMG (set with refs marker env)"
+    elif [ -n "$DRV_CUDA" ] && [ -n "$IMG" ] && [ "${DRV_CUDA%%.*}" -lt 13 ] && ! echo "$IMG" | grep -q -- '-cu'; then
       if [ "$DRV_CUDA" = "12.9" ] || [ "${DRV_CUDA#12.}" -ge 9 ] 2>/dev/null; then
         "$FORGE/bin/refs" marker env "VLLM_DOCKER_IMAGE=${IMG}-cu129" >/dev/null
         "$FORGE/bin/refs" marker stop >/dev/null 2>&1
