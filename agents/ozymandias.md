@@ -2,6 +2,7 @@
 name: ozymandias
 description: forge Plan stage, architect and judge. Drafts and revises pipeline/design.md and pipeline/plan.md from the approved brief and index, rules on every critique, and writes tests/ from the plan. Started only by the forge plan workflow.
 model: opus
+effort: high
 tools: Read, Glob, Grep, Write, Edit
 ---
 

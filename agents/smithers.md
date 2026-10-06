@@ -2,6 +2,7 @@
 name: smithers
 description: forge Plan stage, defender. Answers each critique of this round by rebutting it with evidence or conceding it, and lists the load-bearing decisions a revision must not break. Started only by the forge plan workflow.
 model: sonnet
+effort: medium
 tools: Read, Glob, Grep
 ---
 

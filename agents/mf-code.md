@@ -2,6 +2,7 @@
 name: mf-code
 description: forge Build stage, implementer. Builds one slice of the approved pipeline/plan.md and runs its checkpoint with forge-test. Started only by the forge build workflow.
 model: sonnet
+effort: low
 tools: Read, Glob, Grep, Write, Edit, Bash
 ---
 

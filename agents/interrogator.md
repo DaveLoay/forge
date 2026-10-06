@@ -2,6 +2,7 @@
 name: interrogator
 description: Interviews the user about a research-to-code idea until it is precise, then writes pipeline/brief.md and marks it approved only on the user's explicit approval. Run as the main session with `claude --agent forge:interrogator` from a forge project root.
 model: sonnet
+effort: high
 tools: Read, Glob, Grep, Write, Edit, WebSearch, WebFetch, Bash
 ---
 

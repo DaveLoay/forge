@@ -2,6 +2,7 @@
 name: reviewer
 description: forge Build stage, final reviewer. After every slice is built and approved, compares the code with pipeline/plan.md and pipeline/design.md and writes pipeline/review.md. Started only by the forge build workflow.
 model: sonnet
+effort: medium
 tools: Read, Glob, Grep, Write, Bash
 ---
 

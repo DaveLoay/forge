@@ -2,6 +2,7 @@
 name: mr-curiosity
 description: forge Investigate stage, literature searcher. Given one research sub-question, finds candidate papers and returns them as verified IDs. Started only by the forge investigate workflow, one instance per sub-question.
 model: sonnet
+effort: medium
 tools: Read, Glob, Grep, WebSearch, WebFetch, Bash
 ---
 

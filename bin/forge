@@ -33,6 +33,25 @@ def plugin_installed() -> bool:
     return "forge@forge" in r.stdout
 
 
+def agent_effort(agent: str) -> str | None:
+    """The `effort:` in the agent file's frontmatter. Claude Code ignores it when the agent runs as
+    the main session (`--agent`), so launch() passes it as --effort."""
+    path = PLUGIN_ROOT / "agents" / f"{agent.split(':')[-1]}.md"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    if not lines or lines[0] != "---":
+        return None
+    for line in lines[1:]:
+        if line == "---":
+            break
+        key, _, value = line.partition(":")
+        if key.strip() == "effort" and value.strip():
+            return value.strip()
+    return None
+
+
 def launch(root: Path, agent: str | None) -> int:
     if not shutil.which("claude"):
         print("forge: Claude Code (`claude`) is not on PATH: https://code.claude.com/docs/en/setup")
@@ -42,6 +61,9 @@ def launch(root: Path, agent: str | None) -> int:
         cmd += ["--plugin-dir", str(PLUGIN_ROOT)]
     if agent:
         cmd += ["--agent", agent]
+        effort = agent_effort(agent)
+        if effort:
+            cmd += ["--effort", effort]
     os.chdir(root)
     sys.stdout.flush()
     os.execvp(cmd[0], cmd)

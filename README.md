@@ -122,7 +122,7 @@ forge is a **plugin for Claude Code**. A plugin is a folder that Claude Code loa
 
 | Building block | What it is | In forge |
 |---|---|---|
-| **Agents** (`agents/*.md`) | A specialised AI worker: a role description, a model (Opus, Sonnet or Haiku) and a list of tools it may use. | Interrogator, Hungry-hippo, Mr. Curiosity, Pointer, Ozymandias, J. Jonah Jameson, Smithers, MF-CODE, Reviewer |
+| **Agents** (`agents/*.md`) | A specialised AI worker: a role description, a model (Opus, Sonnet or Haiku), an effort level (Sonnet and Opus agents only) and a list of tools it may use. | Interrogator, Hungry-hippo, Mr. Curiosity, Pointer, Ozymandias, J. Jonah Jameson, Smithers, MF-CODE, Reviewer |
 | **Skills** (`skills/*/SKILL.md`) | Commands you type, such as `/forge:status`. | `/forge:next`, `/forge:approve`, `/forge:status`, `/forge:init` |
 | **Workflows** (`workflows/*.js`) | Small JavaScript programs that run agents in a fixed order. The *script*, not the AI, decides what runs next, so steps can't be skipped. | `/forge:investigate`, `/forge:investigate-index`, `/forge:plan`, `/forge:build` |
 | **Hooks** (`hooks/`) | Code that Claude Code runs before and after every action an agent takes. It can block the action. | the **forge guard**: it allows each agent only its own job and writes the logbook |

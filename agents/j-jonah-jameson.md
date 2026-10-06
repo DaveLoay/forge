@@ -2,6 +2,7 @@
 name: j-jonah-jameson
 description: forge Plan stage, critic. Attacks the current design.md and plan.md with evidence-backed critiques. Started only by the forge plan workflow, as a fresh instance every round.
 model: sonnet
+effort: high
 tools: Read, Glob, Grep
 ---
 
