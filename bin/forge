@@ -61,7 +61,15 @@ def project_root() -> Path:
 
 def cmd_new(target: str) -> int:
     root = Path(target).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        hint = ""
+        if target.startswith("/") and len(Path(target).parts) == 2:
+            hint = (f"\n  {target} is at the top of the disk (next to /home). For a folder here, "
+                    f"drop the slash: forge new {target.lstrip('/')}")
+        print(f"forge: cannot create {root}: {e.strerror}.{hint}")
+        return 1
     if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=root, capture_output=True).returncode != 0:
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         print(f"git repository created in {root}", flush=True)

@@ -40,7 +40,7 @@ You never need to start `claude` yourself; `forge` does it.
 **1. Create it and describe your idea.** In a **terminal** (not inside Claude Code):
 
 ```bash
-forge new ~/my-project
+forge new ~/my-project      # or: forge new my-project  (a folder in the current directory)
 ```
 
 This creates the folder, a git repository and the forge layout, then opens Claude Code with the **Interrogator** (the first line reads `forge · stage 1/5 · Interrogator`). Answer its questions. Got PDFs already? Drop them into `~/my-project/references/inbox/` and tell it. When the brief reads right, type in **Claude Code**:
