@@ -13,11 +13,19 @@ For the human gate. Keep it under ~200 lines: this is the solution, not the code
 
 ## Key decisions
 
-Each decision cites its evidence: an `index.md` row or a reference key.
+Each decision cites its evidence: an `index.md` row, a reference key, or a probe (P-n).
 
 | id | decision | why | evidence |
 |---|---|---|---|
 | D-1 | <choice made> | <reason, and the main alternative rejected> | <[[key]] or index row> |
+
+## Probes
+
+Small checks run during planning (`forge-probe`); the records are in `pipeline/probes/`.
+
+| id | claim | verdict | used by |
+|---|---|---|---|
+| P-1 | <what was checked> | PASS / FAIL | <D-n, risk, or critique id> |
 
 ## Solution
 

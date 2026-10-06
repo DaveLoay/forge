@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""forge-env: the project environment (pixi, conda, docker or venv), declared in pipeline/env/.
+
+  forge-env status [--json]     which environment, and whether it is built from the current spec
+  forge-env create              build or update it from the spec in pipeline/env/
+  forge-env run CMD [ARGS...]   run one command inside it, from the project root
+
+Ozymandias writes the spec and runs `forge-env create` during Plan; approving the design
+fingerprints pipeline/env/, so the build runs in the same environment. See lib/forge_env.py.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+import forge_build as fb  # noqa: E402
+import forge_env as fe  # noqa: E402
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("status", "create", "run"):
+        print(__doc__.strip())
+        return 0 if argv and argv[0] in ("-h", "--help") else 2
+    root = fb.find_root()
+    if root is None:
+        print("forge-env: not inside a forge project")
+        return 1
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "status":
+        ready, msg, env = fe.status(root)
+        if rest == ["--json"]:
+            print(json.dumps({"ready": ready, "message": msg, **env}, indent=1))
+        else:
+            print(f"{'READY' if ready else 'NOT READY'}: {msg}")
+        return 0 if ready else 1
+
+    if cmd == "create":
+        ok, msg = fe.create(root)
+        print(f"{'OK' if ok else 'FAIL'}: {msg}")
+        return 0 if ok else 1
+
+    if not rest:
+        print("usage: forge-env run CMD [ARGS...]")
+        return 2
+    ready, msg, _ = fe.status(root)
+    if not ready:
+        print(f"forge-env: {msg}")
+        return 1
+    full, proc_env = fe.wrap(root, rest)
+    return subprocess.run(full, cwd=root, env=proc_env).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,6 +1,6 @@
 export const meta = {
   name: 'plan',
-  description: 'forge stage 3/5: check the index is approved, then up to 3 council rounds (Ozymandias drafts or revises, J. Jonah Jameson critiques, Smithers defends, Ozymandias rules), then write the tests. Produces pipeline/design.md, plan.md, ledger.md and tests/ for your review.',
+  description: 'forge stage 3/5: check the index is approved, then up to 3 council rounds (Ozymandias builds the environment, drafts or revises with small probes, J. Jonah Jameson critiques, Smithers defends, Ozymandias rules), then write the tests. Produces pipeline/design.md, plan.md, ledger.md, env/, probes/ and tests/ for your review.',
   phases: [{ title: 'Gate' }, { title: 'Round 1' }, { title: 'Round 2' }, { title: 'Round 3' }, { title: 'Tests' }],
 }
 
@@ -13,7 +13,10 @@ const MAX_ROUNDS = 3
 const GATE = { type: 'object', required: ['ok', 'output'], properties: { ok: { type: 'boolean' }, output: { type: 'string' } } }
 const DONE = {
   type: 'object', required: ['summary'],
-  properties: { summary: { type: 'string' }, decisions: { type: 'array', items: { type: 'string' } } },
+  properties: {
+    summary: { type: 'string' }, decisions: { type: 'array', items: { type: 'string' } },
+    probes: { type: 'array', items: { type: 'string' } },   // P-n ids run in this task, with their verdicts
+  },
 }
 const CRITIQUES = {
   type: 'object', required: ['critiques'],
@@ -47,11 +50,12 @@ const TESTS = {
 }
 
 const cell = s => String(s == null ? '' : s).replace(/\|/g, '/').replace(/\s+/g, ' ').trim()
-// Evidence must point somewhere checkable: an index row, a reference key, or a brief/plan/design item.
-const EVIDENCE_RE = /SQ-?\d|AC-?\d|D-?\d|T-?\d|[a-z]+\d{4}[a-z]+|brief|plan\.md|design\.md|index|line/i
+// Evidence must point somewhere checkable: an index row, a reference key, a probe record, or a brief/plan/design item.
+const EVIDENCE_RE = /SQ-?\d|AC-?\d|D-?\d|T-?\d|P-?\d|[a-z]+\d{4}[a-z]+|brief|plan\.md|design\.md|index|line/i
 const hasEvidence = c => typeof c.evidence === 'string' && c.evidence.trim().length > 4 && EVIDENCE_RE.test(c.evidence)
 
-log('forge · stage 3/5 · Plan: gate → council rounds (draft → critique → defend → rule) → tests')
+log('forge · stage 3/5 · Plan: gate → council rounds (environment + draft with probes → critique → defend → rule) → tests')
+const probeNote = d => (d.probes && d.probes.length ? ` Probes: ${d.probes.join('; ')}.` : '')
 
 // ---------------------------------------------------------------- Gate
 phase('Gate')
@@ -84,18 +88,18 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
   // Draft or revise
   if (round === 1) {
     const d = await agent(
-      'Round 1. Draft pipeline/design.md and pipeline/plan.md from the approved pipeline/brief.md and pipeline/index.md, following your instructions and the templates. Set `round: 1` and `status: draft` in both frontmatters. Return a short summary and the list of key decisions (D-n: one line each).',
+      'Round 1. First write the environment spec in pipeline/env/ from the brief\'s Environment section and build it with `forge-env create`, as your instructions describe. Then draft pipeline/design.md and pipeline/plan.md from the approved pipeline/brief.md and pipeline/index.md, following your instructions and the templates; where a decision depends on a fact about the data or the tools that a small probe can check, run one with `forge-probe`. Set `round: 1` and `status: draft` in both frontmatters. Return a short summary, the list of key decisions (D-n: one line each), and the probes you ran (P-n: verdict).',
       { agentType: OZ, schema: DONE, label: `round ${round}: draft` },
     )
     if (!d) return { stopped: true, reason: 'Ozymandias could not draft the plan.' }
-    log(`Round 1 draft: ${d.summary}`)
+    log(`Round 1 draft: ${d.summary}${probeNote(d)}`)
   } else {
     const d = await agent(
-      `Round ${round}. Revise pipeline/design.md and pipeline/plan.md. Address every accepted critique below, keep the load-bearing decisions unless an accepted critique requires changing one, and set \`round: ${round}\` in both frontmatters. pipeline/ledger.md has the full record.\n\nAccepted critiques to address:\n${pending.map(c => `- ${c.id} [${c.severity}] ${c.claim} (ruling: ${c.reason})`).join('\n')}\n\nLoad-bearing decisions (from Smithers):\n${loadBearing.map(l => `- ${l.id}: ${l.reason}`).join('\n') || '- none listed'}\n\nReturn a summary of what changed, critique by critique.`,
+      `Round ${round}. Revise pipeline/design.md and pipeline/plan.md. Address every accepted critique below, keep the load-bearing decisions unless an accepted critique requires changing one, and set \`round: ${round}\` in both frontmatters. pipeline/ledger.md has the full record.\n\nAccepted critiques to address:\n${pending.map(c => `- ${c.id} [${c.severity}] ${c.claim} (ruling: ${c.reason})`).join('\n')}\n\nLoad-bearing decisions (from Smithers):\n${loadBearing.map(l => `- ${l.id}: ${l.reason}`).join('\n') || '- none listed'}\n\nWhere a critique turns on a fact a small probe can settle, run one (forge-probe) instead of arguing. If the dependencies change, update pipeline/env/ and run \`forge-env create\`. Return a summary of what changed, critique by critique, and the probes you ran (P-n: verdict).`,
       { agentType: OZ, schema: DONE, label: `round ${round}: revise` },
     )
     if (!d) return { stopped: true, reason: `Ozymandias could not revise the plan in round ${round}.` }
-    log(`Round ${round} revision: ${d.summary}`)
+    log(`Round ${round} revision: ${d.summary}${probeNote(d)}`)
   }
 
   // Critique (fresh critic every round)
@@ -120,7 +124,7 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
 
     // Rule: every critique must get a ruling; ask once more for any that are missing.
     const ask = list => agent(
-      `Round ${round}. Rule on each critique below: accepted (the next revision must address it) or rejected, with reason and evidence. Weigh Smithers' response on its evidence.\n\n${list.map(c => {
+      `Round ${round}. Rule on each critique below: accepted (the next revision must address it) or rejected, with reason and evidence. Weigh Smithers' response on its evidence. If a ruling turns on a fact a small probe can settle, run one (forge-probe) and cite it as P-n.\n\n${list.map(c => {
         const r = responses.find(x => x.id === c.id)
         return `- ${c.id} [${c.severity}] ${c.claim}\n  critic's evidence: ${c.evidence}\n  Smithers: ${r ? `${r.response}: ${r.argument}${r.evidence ? ` (evidence: ${r.evidence})` : ''}` : 'no response'}`
       }).join('\n')}`,
@@ -183,7 +187,7 @@ const lastOpen = history.length ? history[history.length - 1].open : []
 const fin = await agent(
   `Final revision. ${pending.length ? `Address these accepted critiques from the last round:\n${pending.map(c => `- ${c.id} [${c.severity}] ${c.claim} (ruling: ${c.reason})`).join('\n')}\n` : 'No accepted critiques are left. '}` +
   `${lastOpen.length ? `The council stopped at the round limit, so these blocker/major items were not re-reviewed: list each of them in design.md's Risks as "not re-reviewed by the council: <id>". ` : ''}` +
-  'Set `status: final` in the frontmatter of pipeline/design.md and pipeline/plan.md. Return a summary of the final changes.',
+  'Make sure design.md\'s Probes table lists every probe in pipeline/probes/probes.md that a decision relies on, and that `forge-env status` reports the environment READY (run `forge-env create` if not). Set `status: final` in the frontmatter of pipeline/design.md and pipeline/plan.md. Return a summary of the final changes.',
   { agentType: OZ, schema: DONE, label: 'final revision' },
 )
 log(fin ? `Final: ${fin.summary}` : 'Warning: the final revision did not complete')
@@ -206,6 +210,6 @@ return {
   set_aside_without_evidence: history.reduce((n, h) => n + h.setAside.length, 0),
   not_re_reviewed: lastOpen.map(c => c.id),
   tests: tests ? `${tests.files.length} files, ${tests.coverage.length} specs covered${tests.not_written && tests.not_written.length ? `, not written: ${tests.not_written.join('; ')}` : ''}` : 'writing tests failed',
-  files: ['pipeline/design.md', 'pipeline/plan.md', 'pipeline/ledger.md', 'tests/'],
-  next: 'Read pipeline/design.md (and pipeline/ledger.md for the debate). If you agree, run /forge:approve design: that locks tests/ and opens the build stage. If not, do not approve; say what is wrong so the plan can be revised.',
+  files: ['pipeline/design.md', 'pipeline/plan.md', 'pipeline/ledger.md', 'pipeline/env/', 'pipeline/probes/probes.md', 'tests/'],
+  next: 'Read pipeline/design.md (and pipeline/ledger.md for the debate, pipeline/probes/probes.md for what the probes showed). If you agree, run /forge:approve design: that locks tests/, fixes the environment in pipeline/env/, and opens the build stage. If not, do not approve; say what is wrong so the plan can be revised.',
 }

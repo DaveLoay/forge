@@ -9,6 +9,10 @@ references/*
 __pycache__/
 *.pyc
 .venv/
+.forge-env/
+pipeline/env/.pixi/
+pipeline/.env-state.json
+pipeline/probes/out/*/output.txt
 .env
 .DS_Store
 # <<< forge <<<

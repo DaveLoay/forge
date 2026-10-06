@@ -41,6 +41,8 @@ It is installed once from GitHub and used in every project. A project only holds
 | Human gates | brief → candidates → index → design (→ build slices). `/forge:approve <gate>` runs `bin/forge-approve` through skill shell injection, so it executes only when the user types it (hooks don't see it; the guard blocks agents from running it). It stores the approved file's SHA-256 in `pipeline/approvals/<gate>.json`; `forge-gate <gate>` and the guard treat any later edit, or a stale earlier gate, as not approved. The Interrogator can't write `status: approved`. |
 | Investigate shape | Two plugin workflows, because workflows can't wait for input: `/forge:investigate` (gate → seed papers → one Mr. Curiosity per sub-question → `refs resolve` on every ID → `pipeline/candidates.md`) and `/forge:investigate-index` (gate → fetch + convert kept papers → one Pointer per sub-question → `pipeline/index.md`). The scripts build both files from structured agent output; agents only write them out. Workflow agents are launched by `agentType`, so the guard sees `forge:hungry-hippo`, `forge:mr-curiosity`, `forge:pointer`. Dynamic workflows must be enabled in `/config` on the Pro plan. |
 | Model aliases and effort | Agent files use `sonnet`, `opus`, `haiku` aliases so they follow the current model versions. Each Sonnet and Opus agent sets `effort` in its frontmatter, which overrides the session effort (2026-10-06): high for Interrogator, Ozymandias and J. Jonah Jameson; medium for Mr. Curiosity, Smithers and Reviewer; low for MF-CODE. The Haiku agents (Hungry-hippo, Pointer) set none because Haiku 4.5 does not support effort. Claude Code ignores frontmatter `effort` when an agent runs as the main session (`--agent`; checked 2026-10-06, v2.1.291), so `bin/forge` reads it from the agent file and passes `--effort` for the Interrogator. |
+| Project environment | The Interrogator asks which package manager or container the user wants (pixi, conda, docker, venv), and the brief records it with the Python version, system tools, hardware and data location. Ozymandias writes the spec in `pipeline/env/` (`pixi.toml`, `environment.yml`, `Dockerfile` or `requirements.txt`; the first found decides) and builds it with `forge-env create`. `/forge:approve design` fingerprints `pipeline/env/` (minus `.pixi/`) with design.md and plan.md, so MF-CODE cannot change it without withdrawing the approval; after approval, pixi installs `--frozen`. `forge-probe`, `forge-test` and MF-CODE (`forge-env run`) all run through `lib/forge_env.py`. Projects without `pipeline/env/` keep using a hand-made `.venv` (2026-10-06). |
+| Probes | Ozymandias may run small checks during Plan with `forge-probe pipeline/probes/P-n_<name>.py|.sh`: a header states the claim, what it settles and the pass condition; the script prints `RESULT: PASS|FAIL`; it runs in the project environment with a 10-minute limit; a probe that changes a project file outside `pipeline/probes/` is INVALID (size and mtime of every file before and after). The records (`P-n.json`, `probes.md`) are written by `forge-probe`, which the guard keeps Ozymandias from writing; critiques and rulings may cite `P-n` as evidence (2026-10-06). Docker path checked live: a probe ran in a `python:3.11-slim` image, its output files are owned by the user, and a timed-out probe's container is killed. |
 | `refs` dependencies | Standard library only, no `uv` (2026-10-04). PDF downloads fall back to `curl` when a publisher serves Python an HTML interstitial (Nature does). |
 | Open-access lookup | arXiv → Semantic Scholar `openAccessPdf` → Unpaywall (only if `FORGE_EMAIL` is set) → Crossref PDF links (2026-10-04). |
 | OCR request | `POST https://api.mistral.ai/v1/ocr`, model `mistral-ocr-latest` (`MISTRAL_OCR_MODEL` overrides), upload to `/v1/files`, OCR a signed URL, then delete the upload (the inline base64 route is rate-limited on the free tier). Same endpoint, model and key as the Obsidian `marker-api` plugin. Cost depends only on the key's Mistral workspace: on the free Experiment tier (no billing card) it costs nothing and is rate-limited; a workspace with a card pays ~$4 per 1,000 pages (checked 2026-10-04). |
@@ -53,10 +55,10 @@ It is installed once from GitHub and used in every project. A project only holds
 | `hungry-hippo.md` | haiku | investigate | brief, `MISSING.md` | runs `refs fetch` / `refs convert` |
 | `mr-curiosity.md` | sonnet, ×N in parallel | investigate | one sub-question, `catalog.md` | candidate list (JSON) |
 | `pointer.md` | haiku | investigate | brief, `catalog.md`, `references/*/*.md` | `pipeline/index.md` |
-| `ozymandias.md` | opus | plan | brief, index, ledger | `design.md`, `plan.md`, rulings in `ledger.md`, `tests/` |
+| `ozymandias.md` | opus | plan | brief, index, ledger, probe records | `design.md`, `plan.md`, rulings in `ledger.md`, `tests/`, `pipeline/env/`, probe scripts (runs `forge-env create`, `forge-probe`) |
 | `j-jonah-jameson.md` | sonnet | plan | design, plan, index, ledger | critiques (JSON) |
 | `smithers.md` | sonnet | plan | plan, this round's critiques, index | rebuttals or concessions + load-bearing list (JSON) |
-| `mf-code.md` | sonnet | build | `plan.md` (one slice at a time) | `src/`, `build-log.md` |
+| `mf-code.md` | sonnet | build | `plan.md` (one slice at a time) | `src/`, `build-log.md` (runs code with `forge-env run`) |
 | `reviewer.md` | sonnet | build | plan, design, the diff | review notes in `build-log.md` |
 
 ## 4. Stage contracts
@@ -126,7 +128,7 @@ forge/
   workflows/       investigate.js  plan.js  build.js
   skills/          status/  init/
   hooks/           hooks.json  forge-guard.py
-  bin/             refs  forge-init  forge-approve  forge-gate  forge-test  forge-build-status
+  bin/             refs  forge-init  forge-approve  forge-gate  forge-env  forge-probe  forge-test  forge-build-status
   templates/       brief.md  design.md  plan.md  ledger.md  project.gitignore
   docs/            BUILD_PLAN.md
 ```
@@ -140,6 +142,8 @@ my-project/
     smith2024transfers/          .md  .pdf  images/  ocr.json
     catalog.md  references.bib  MISSING.md
   pipeline/   brief.md  index.md  design.md  ledger.md  plan.md  build-log.md
+              env/      environment spec (pixi.toml, environment.yml, Dockerfile or requirements.txt)
+              probes/   P-n_<name>.py|.sh, P-n.json, probes.md, out/P-n/
   tests/                         written during planning, locked during build
   src/
 ```

@@ -5,7 +5,8 @@ An approval is pipeline/approvals/<gate>.json holding the SHA-256 of the approve
 It is valid only while the files still have that exact content, so any edit after
 approval withdraws it. Gates form a chain: each needs the one before it.
 
-Gates: brief, candidates, index, design (design.md + plan.md), slice-1, slice-2, ...
+Gates: brief, candidates, index, design (design.md + plan.md, plus the environment spec in
+pipeline/env/ when there is one), slice-1, slice-2, ...
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ GATES: dict[str, tuple[list[str], str | None]] = {
     "design": (["pipeline/design.md", "pipeline/plan.md"], "index"),
 }
 SLICE_RE = re.compile(r"^slice-(\d+)$")
+ENV_DIR = "pipeline/env"
+# Built environments and caches inside pipeline/env/ are not part of the spec.
+SKIP_PARTS = {".pixi", "__pycache__", ".DS_Store"}
 
 
 def gate_spec(gate: str) -> tuple[list[str], str | None]:
@@ -36,6 +40,14 @@ def gate_spec(gate: str) -> tuple[list[str], str | None]:
     raise KeyError(gate)
 
 
+def gate_files(root: Path, gate: str) -> tuple[list[str], str | None]:
+    """gate_spec, plus pipeline/env/ for the design gate when the project has an environment spec."""
+    rels, before = gate_spec(gate)
+    if gate == "design" and (root / ENV_DIR).is_dir():
+        rels = [*rels, ENV_DIR]
+    return rels, before
+
+
 def known_gates() -> str:
     return ", ".join(GATES) + ", slice-N"
 
@@ -44,12 +56,23 @@ def _sha_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def dir_sha(root: Path, rel: str) -> str:
+    """Fingerprint of the files under a directory (paths and contents), ignoring SKIP_PARTS."""
+    h = hashlib.sha256()
+    base = root / rel
+    if base.is_dir():
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and not SKIP_PARTS & set(p.relative_to(base).parts):
+                h.update(f"{p.relative_to(root)}:{_sha_file(p)}\n".encode())
+    return h.hexdigest()
+
+
 def _sha(root: Path, rels: list[str]) -> str:
     if len(rels) == 1:  # single file: plain file hash (keeps older approvals valid)
         return _sha_file(root / rels[0])
     h = hashlib.sha256()
     for r in rels:
-        h.update(f"{r}:{_sha_file(root / r)}\n".encode())
+        h.update(f"{r}:{dir_sha(root, r) if (root / r).is_dir() else _sha_file(root / r)}\n".encode())
     return h.hexdigest()
 
 
@@ -86,7 +109,7 @@ def approval_file(root: Path, gate: str) -> Path:
 def check(root: Path, gate: str) -> tuple[bool, str]:
     """(ok, reason). Checks the gate and, recursively, the gates before it."""
     try:
-        rels, before = gate_spec(gate)
+        rels, before = gate_files(root, gate)
     except KeyError:
         return False, f"unknown gate '{gate}' (known: {known_gates()})"
     if before:
@@ -97,7 +120,7 @@ def check(root: Path, gate: str) -> tuple[bool, str]:
     rec = approval_file(root, gate)
     if not rec.is_file():
         return False, f"{names} has not been approved: run /forge:approve {gate}"
-    missing = [r for r in rels if not (root / r).is_file()]
+    missing = [r for r in rels if not (root / r).exists()]
     if missing:
         return False, f"{', '.join(missing)} was approved but no longer exists"
     data = json.loads(rec.read_text(encoding="utf-8"))
@@ -111,14 +134,14 @@ def check(root: Path, gate: str) -> tuple[bool, str]:
 
 def approve(root: Path, gate: str) -> str:
     try:
-        rels, before = gate_spec(gate)
+        rels, before = gate_files(root, gate)
     except KeyError:
         raise ValueError(f"unknown gate '{gate}' (known: {known_gates()})") from None
     if before:
         ok, why = check(root, before)
         if not ok:
             raise ValueError(f"cannot approve {gate} yet: {why}")
-    missing = [r for r in rels if not (root / r).is_file()]
+    missing = [r for r in rels if not (root / r).exists()]
     if missing:
         raise ValueError(f"{', '.join(missing)} does not exist yet")
     if SLICE_RE.match(gate):

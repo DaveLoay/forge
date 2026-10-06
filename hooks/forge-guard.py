@@ -74,9 +74,11 @@ STAGES: dict[str, dict] = {
     },
     "forge:ozymandias": {
         "label": "stage 3/5 · Plan · Ozymandias",
-        "tools": {"Read", "Glob", "Grep", "Write", "Edit"},
-        "write": ["pipeline/design.md", "pipeline/plan.md", "pipeline/ledger.md", "tests/**"],
-        "bash": None,
+        "tools": {"Read", "Glob", "Grep", "Write", "Edit", "Bash"},
+        "write": ["pipeline/design.md", "pipeline/plan.md", "pipeline/ledger.md", "tests/**",
+                  "pipeline/env/**", "pipeline/probes/P-*.py", "pipeline/probes/P-*.sh"],
+        # the environment spec it writes, and probes: small checks whose records forge-probe writes
+        "bash": ["forge-env create", "forge-env status", "forge-probe"],
         "pdf_downloads": False,
         "read_pdfs": False,
         "requires": "index",
@@ -94,7 +96,8 @@ STAGES: dict[str, dict] = {
         "tools": {"Read", "Glob", "Grep", "Write", "Edit", "Bash"},
         "write": ["src/**", "docs/**", "outputs/**", "pyproject.toml", "requirements*.txt",
                   "pipeline/slices/slice-*.md", "pipeline/build-log.md"],
-        "bash": ["python3 -m venv .venv", ".venv/bin/pip install", ".venv/bin/python", "forge-test", "forge-build-status"],
+        # the environment was built during Plan and approved with the design; code runs inside it
+        "bash": ["forge-env run", "forge-env status", "forge-env create", "forge-test", "forge-build-status"],
         "pdf_downloads": False,
         "read_pdfs": False,
         "requires": "design",
@@ -220,7 +223,7 @@ def bash_is_readonly(cmd: str) -> bool:
                 return False
         elif exe in ("forge-gate", "forge-build-status"):
             continue
-        elif exe in ("refs", "forge"):
+        elif exe in ("refs", "forge", "forge-env"):
             if len(words) < 2 or words[1] != "status":
                 return False
         elif exe == "find":

@@ -7,6 +7,15 @@ status: draft            # draft | final
 
 The builder's contract. MF-CODE implements one slice at a time and may not change `tests/`.
 
+## Environment
+
+Built during planning with `forge-env create` and approved with the design. MF-CODE uses it as it is
+(`forge-env run ...`) and does not create another.
+
+- Kind and spec: <pixi: pipeline/env/pixi.toml / conda: pipeline/env/environment.yml / docker: pipeline/env/Dockerfile / venv: pipeline/env/requirements.txt>
+- Key packages and tools: <package (version): why>
+- Hardware: <CPU / GPU>
+
 ## File tree
 
 ```

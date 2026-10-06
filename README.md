@@ -91,10 +91,10 @@ flowchart TD
 | **Mr. Curiosity** | Sonnet | 2 | Searches for papers, one instance per research sub-question | nothing |
 | **Hungry-hippo** | Haiku | 2 | The clerk: runs `refs` to verify, fetch and convert papers | `pipeline/candidates.md` |
 | **Pointer** | Haiku | 2 | Finds which paper, section and lines answer each sub-question | `pipeline/index.md` |
-| **Ozymandias** | Opus | 3 | Architect and judge: drafts the design, rules on critiques, writes tests | `design.md`, `plan.md`, `ledger.md`, `tests/` |
+| **Ozymandias** | Opus | 3 | Architect and judge: builds the project environment, drafts the design, checks facts with small probes, rules on critiques, writes tests | `design.md`, `plan.md`, `ledger.md`, `tests/`, `pipeline/env/`, probe scripts |
 | **J. Jonah Jameson** | Sonnet | 3 | Critic: a fresh instance every round, attacks the plan with evidence | nothing |
 | **Smithers** | Sonnet | 3 | Defender: rebuts each critique with evidence, or concedes it | nothing |
-| **MF-CODE** | Sonnet | 5 | Builds one slice of the plan | `src/`, `docs/`, … never `tests/` |
+| **MF-CODE** | Sonnet | 5 | Builds one slice of the plan, inside the environment built during Plan | `src/`, `docs/`, … never `tests/` or `pipeline/env/` |
 | **Reviewer** | Sonnet | 5 | Checks that what was built is what was planned | `pipeline/review.md` |
 
 ### The guard: how every action is checked
@@ -126,7 +126,7 @@ forge is a **plugin for Claude Code**. A plugin is a folder that Claude Code loa
 | **Skills** (`skills/*/SKILL.md`) | Commands you type, such as `/forge:status`. | `/forge:next`, `/forge:approve`, `/forge:status`, `/forge:init` |
 | **Workflows** (`workflows/*.js`) | Small JavaScript programs that run agents in a fixed order. The *script*, not the AI, decides what runs next, so steps can't be skipped. | `/forge:investigate`, `/forge:investigate-index`, `/forge:plan`, `/forge:build` |
 | **Hooks** (`hooks/`) | Code that Claude Code runs before and after every action an agent takes. It can block the action. | the **forge guard**: it allows each agent only its own job and writes the logbook |
-| **Tools** (`bin/`) | Ordinary command-line programs that agents (and you) can run. | `forge` (the launcher), `refs` (papers), `forge-init`, `forge-approve`, `forge-gate`, `forge-test`, `forge-build-status` |
+| **Tools** (`bin/`) | Ordinary command-line programs that agents (and you) can run. | `forge` (the launcher), `refs` (papers), `forge-init`, `forge-approve`, `forge-gate`, `forge-env` (the project environment), `forge-probe` (small checks during Plan), `forge-test`, `forge-build-status` |
 
 So forge is not one thing. It is a set of agents with narrow jobs, workflows that run them in order, a guard that keeps them in their lane, and tools that do the parts that should be exact (downloading, converting, checking, testing) without AI.
 
@@ -136,7 +136,7 @@ Each stage reads the files the previous stage wrote, and refuses to start until 
 
 ### 1. Interrogator: from idea to brief
 
-You talk with the Interrogator until your idea is precise. If you name papers, it fetches and converts them (through `refs`) and reads them, so its questions are informed. It writes `pipeline/brief.md`: goal, non-goals, hypothesis, acceptance criteria that can be tested, constraints, research sub-questions, seed references.
+You talk with the Interrogator until your idea is precise. If you name papers, it fetches and converts them (through `refs`) and reads them, so its questions are informed. It writes `pipeline/brief.md`: goal, non-goals, hypothesis, acceptance criteria that can be tested, constraints, the environment you want (pixi, conda, docker or venv; Python version, system tools such as ffmpeg, GPU), research sub-questions, seed references.
 
 - Start it: `forge new <folder>` for a new project, or `forge` in a project whose brief isn't approved yet
 - Approve: `/forge:approve brief`
@@ -150,8 +150,8 @@ You talk with the Interrogator until your idea is precise. If you name papers, i
 
 `/forge:plan` runs up to 3 rounds of:
 
-1. **Ozymandias** (Opus) drafts or revises `pipeline/design.md` (for you) and `pipeline/plan.md` (for the builder).
-2. **J. Jonah Jameson** criticises them. Every critique needs evidence: an index row or a paper.
+1. **Ozymandias** (Opus) drafts or revises `pipeline/design.md` (for you) and `pipeline/plan.md` (for the builder). In the first round it writes the environment spec in `pipeline/env/` (as the brief asks) and builds it with `forge-env create`. When a decision depends on a fact it can check cheaply, it runs a **probe** with `forge-probe`: a short script with one stated claim and pass condition, such as ffprobe on the dataset's sample rate, or a spectrogram that should show the predicted peaks. Probes run in the project environment, stop after 10 minutes, may not change project files, and `forge-probe` itself records what they showed in `pipeline/probes/probes.md`.
+2. **J. Jonah Jameson** criticises them. Every critique needs evidence: an index row, a paper or a probe (`P-n`).
 3. **Smithers** rebuts each critique with evidence or concedes it.
 4. **Ozymandias** rules on every critique: accepted or rejected, with a reason.
 
@@ -159,11 +159,11 @@ It stops when no accepted major problem remains, or after 3 rounds. Everything i
 
 ### 4. You review the design
 
-Read `pipeline/design.md` (short, written for you) and, if you want the debate, `pipeline/ledger.md`. If you agree: `/forge:approve design`. That also **locks `tests/`**: from then on no agent can change a test.
+Read `pipeline/design.md` (short, written for you) and, if you want the debate, `pipeline/ledger.md`. If you agree: `/forge:approve design`. That also **locks `tests/`**: from then on no agent can change a test. It also fingerprints `pipeline/env/`, so the build runs in exactly the environment the plan was made and probed in.
 
 ### 5. Build: one slice at a time
 
-`/forge:build` builds the next slice of the plan. **MF-CODE** writes the code. Then `forge-test` runs the slice's tests exactly as the approved plan states them, and records the result itself, so the agent can't claim a pass. At most 3 attempts; after that it stops with a blocker report instead of looping. Read `pipeline/slices/slice-N.md`, then `/forge:approve slice-N`, then `/forge:build` again. After the last slice, a **Reviewer** compares the code with the plan and writes `pipeline/review.md`.
+`/forge:build` builds the next slice of the plan. **MF-CODE** writes the code, running it inside the project environment (`forge-env run ...`). Then `forge-test` runs the slice's tests exactly as the approved plan states them, and records the result itself, so the agent can't claim a pass. At most 3 attempts; after that it stops with a blocker report instead of looping. Read `pipeline/slices/slice-N.md`, then `/forge:approve slice-N`, then `/forge:build` again. After the last slice, a **Reviewer** compares the code with the plan and writes `pipeline/review.md`.
 
 At any point, `/forge:status` tells you where the project stands and what to do next.
 

@@ -128,9 +128,10 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(guard(self.root, MF, "Write", {"file_path": p}), "pass", p)
         for p in ("tests/test_x.py", "pipeline/plan.md", "pipeline/slices/slice-1.tests.json", "pipeline/approvals/slice-1.json", "references/x.md"):
             self.assertEqual(guard(self.root, MF, "Write", {"file_path": p}), "deny", p)
-        for c in ("python3 -m venv .venv", ".venv/bin/pip install numpy scipy", ".venv/bin/python -m pytest tests/test_x.py -q", "forge-test 1", "forge-build-status --json"):
+        for c in ("forge-env run python -m pytest tests/test_x.py -q", "forge-env status", "forge-test 1", "forge-build-status --json"):
             self.assertEqual(guard(self.root, MF, "Bash", {"command": c}), "pass", c)
-        for c in ("pip install numpy", "forge-approve slice-1", ".venv/bin/python x.py > tests/a", "rm -rf tests", "python3 x.py"):
+        for c in ("pip install numpy", "forge-approve slice-1", "forge-env run python x.py > tests/a", "rm -rf tests", "python3 x.py",
+                  "python3 -m venv .venv", ".venv/bin/pip install numpy"):
             self.assertEqual(guard(self.root, MF, "Bash", {"command": c}), "deny", c)
         self.assertEqual(guard(self.root, "forge:reviewer", "Write", {"file_path": "pipeline/review.md"}), "pass")
         self.assertEqual(guard(self.root, "forge:reviewer", "Write", {"file_path": "src/a.py"}), "deny")

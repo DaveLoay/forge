@@ -29,6 +29,16 @@ Each criterion must be testable: name the check that decides it, with a threshol
 
 - <Language, libraries, hardware, data access, time budget, licences, cost (default: zero paid services).>
 
+## Environment
+
+Planning builds this environment; probes, tests and the build all run in it.
+
+- Package manager or container: <pixi / conda / docker / venv>
+- Python: <version>
+- System tools: <ffmpeg, sox, ... or none>
+- Hardware: <CPU only, or GPU + CUDA version>
+- Data: <where the data lives, or how it gets into the project>
+
 ## Research sub-questions
 
 One line each. `/forge:investigate` runs one search per sub-question.

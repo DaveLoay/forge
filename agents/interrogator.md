@@ -26,7 +26,7 @@ Then greet the user in one line and ask your first questions.
 ## How to interview
 
 - Talk in plain language, in the user's language. Ask at most three questions per turn, all on the same topic, numbered so they can answer briefly.
-- Work through the topics in this order, but skip whatever the user has already answered: goal → non-goals → hypothesis → acceptance criteria → constraints → research sub-questions → seed references → open questions.
+- Work through the topics in this order, but skip whatever the user has already answered: goal → non-goals → hypothesis → acceptance criteria → constraints → environment → research sub-questions → seed references → open questions.
 - Offer concrete options when the user seems unsure ("For the visualisation, do you mean (a) spectra averaged over many tracks, (b) a per-track spectrogram, or (c) both?"). Mark your recommendation.
 - Never invent facts about a paper, dataset or method. If you are not sure and the papers you have read don't say, it becomes a sub-question or an open question.
 
@@ -51,6 +51,7 @@ When the user's idea starts from specific papers, read them before asking detail
 - **Hypothesis:** what is expected to be true, and what result would show it is false.
 - **Acceptance criteria:** this is where you push hardest. Every criterion must name what is measured, on which data, and the pass condition or threshold, so that a test can decide it without human judgement. Reject "works well", "looks right", "is accurate", and turn them into checks. A criterion about a figure must say what the figure must show (for example: peaks at the predicted frequencies, within a stated tolerance). If a threshold is unknown before reading the literature, write the criterion with `<threshold: from SQ-n>` and add the sub-question that will settle it.
 - **Constraints:** language, libraries, hardware, data access, time. Ask about cost explicitly; the default is zero paid services.
+- **Environment:** ask explicitly; the plan and the build run in it. Which package manager or container: pixi, conda, docker or a plain venv (if the user has no preference, recommend pixi: it handles Python packages and system tools such as ffmpeg in one lockfile). The Python version, the system tools the work needs (ffmpeg, sox, ...), the hardware (CPU only, or a GPU with which CUDA version), and where the data lives (a path in the project, or how it gets there). Planning writes and builds the environment from this, so don't write the spec yourself.
 - **Research sub-questions:** between 2 and 6, each answerable from the literature, each one line. They drive `/forge:investigate`.
 - **Seed references:** DOIs, arXiv IDs or PDF file names, as identifiers that `refs fetch` can resolve.
 - **Open questions:** allowed only if none of them blocks planning. Say which ones you consider blocking.

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""forge-probe: run one small, concrete check during Plan, and record what it showed.
+
+  forge-probe pipeline/probes/P-3_sample_rate.py [--timeout SECONDS]
+
+A probe is a short Python (.py) or shell (.sh) script that Ozymandias writes to settle one
+question before committing the plan to it: the sample rate of the dataset's tracks, whether
+a spectrogram shows the predicted peaks, how a statistic behaves on a small sample. No
+training, no downloads, nothing long. Its first lines must state what it proves:
+
+    # claim: every track in data/raw is 44.1 kHz stereo
+    # settles: D-2, SQ-1
+    # pass if: ffprobe reports sample_rate=44100 and channels=2 for all files
+
+and it should end by printing `RESULT: PASS <detail>` or `RESULT: FAIL <detail>`. It runs in
+the project environment (forge-env) from the project root, with FORGE_PROBE_OUT set to its
+output folder (pipeline/probes/out/P-3/) for plots and tables. The run stops after
+--timeout seconds (default and maximum 600). A probe that changes any project file outside
+pipeline/probes/ is marked INVALID.
+
+The record is written by this command, not by the agent: pipeline/probes/P-3.json, and
+pipeline/probes/probes.md, which lists every probe. Design decisions cite probes as P-n.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+import forge_build as fb  # noqa: E402
+import forge_env as fe  # noqa: E402
+
+MAX_TIMEOUT = 600
+PROBES = "pipeline/probes"
+NAME_RE = re.compile(r"^P-(\d+)[_-][A-Za-z0-9_.-]*\.(py|sh)$")
+HEADER = {"claim": re.compile(r"^#\s*claim:\s*(\S.*)$", re.I),
+          "settles": re.compile(r"^#\s*settles:\s*(\S.*)$", re.I),
+          "pass_if": re.compile(r"^#\s*pass if:\s*(\S.*)$", re.I)}
+RESULT_RE = re.compile(r"^RESULT:\s*(PASS|FAIL)\b\s*(.*)$", re.M)
+# Not project state: environments, caches, the probes' own folder, files the guard hook writes.
+SKIP_DIRS = {".git", ".venv", ".forge-env", ".pixi", "__pycache__", ".pytest_cache", "node_modules"}
+SKIP_FILES = {"pipeline/run-log.md", "pipeline/.stage"}
+
+
+def state(root: Path) -> dict[str, tuple[int, int]]:
+    """(size, mtime) of every project file outside pipeline/probes/: cheap enough for large datasets."""
+    files: dict[str, tuple[int, int]] = {}
+    probes = root / PROBES
+    for d, dirs, names in os.walk(root):
+        dp = Path(d)
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and dp / x != probes]
+        for n in names:
+            p = dp / n
+            r = str(p.relative_to(root))
+            if r in SKIP_FILES:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            files[r] = (st.st_size, st.st_mtime_ns)
+    return files
+
+
+def header(text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for line in text.splitlines()[:30]:
+        for key, rx in HEADER.items():
+            m = rx.match(line.strip())
+            if m and key not in found:
+                found[key] = m.group(1).strip()
+    return found
+
+
+def cell(s: str) -> str:
+    return str(s).replace("|", "/").replace("\n", " ").strip()
+
+
+def write_index(root: Path) -> None:
+    """Regenerate probes.md from every P-n.json record."""
+    recs = []
+    for f in (root / PROBES).glob("P-*.json"):
+        try:
+            recs.append(json.loads(f.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    recs.sort(key=lambda r: r.get("n", 0))
+    lines = ["# Probes", "",
+             "Written by `forge-probe`, one entry per probe (its latest run). Do not edit; the records are "
+             "`pipeline/probes/P-n.json`. Design decisions and critiques cite probes as P-n.", "",
+             "| id | verdict | claim | settles | ran | outputs |", "|---|---|---|---|---|---|"]
+    for r in recs:
+        outs = ", ".join(r.get("outputs", [])[:6]) or "none"
+        lines.append(f"| {r['id']} | {r['verdict']} | {cell(r['claim'])} | {cell(r['settles'])} | {r['ran_at']} | {cell(outs)} |")
+    for r in recs:
+        lines += ["", f"## {r['id']}: {r['verdict']}", "",
+                  f"- script: `{r['script']}` (sha256 {r['script_sha256'][:12]})",
+                  f"- claim: {r['claim']}", f"- settles: {r['settles']}", f"- pass if: {r['pass_if']}",
+                  f"- result: {r['result'] or 'no RESULT line'}",
+                  f"- exit {r['exit']}, {r['seconds']} s, environment: {r['environment']}"]
+        if r.get("changed_files"):
+            lines.append(f"- INVALID: changed project files: {', '.join(r['changed_files'][:20])}")
+        lines += ["", "```", r.get("tail", ""), "```"]
+    (root / PROBES / "probes.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv: list[str]) -> int:
+    timeout = MAX_TIMEOUT
+    args = list(argv)
+    if "--timeout" in args:
+        i = args.index("--timeout")
+        try:
+            timeout = int(args[i + 1])
+        except (IndexError, ValueError):
+            print("forge-probe: --timeout needs a number of seconds")
+            return 2
+        del args[i:i + 2]
+        if not 1 <= timeout <= MAX_TIMEOUT:
+            print(f"forge-probe: --timeout must be between 1 and {MAX_TIMEOUT} seconds")
+            return 2
+    if len(args) != 1 or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if args and args[0] in ("-h", "--help") else 2
+    root = fb.find_root()
+    if root is None:
+        print("FAIL: not inside a forge project")
+        return 1
+
+    script = Path(args[0])
+    script = (script if script.is_absolute() else Path.cwd() / script).resolve()
+    try:
+        rel = script.relative_to(root)
+    except ValueError:
+        rel = None
+    m = NAME_RE.match(script.name)
+    if rel is None or rel.parent != Path(PROBES) or not m:
+        print(f"FAIL: a probe is pipeline/probes/P-<n>_<name>.py or .sh, not {args[0]}")
+        return 2
+    if not script.is_file():
+        print(f"FAIL: {rel} does not exist")
+        return 2
+    text = script.read_text(encoding="utf-8", errors="replace")
+    head = header(text)
+    missing = [k.replace("_", " ") for k in HEADER if k not in head]
+    if missing:
+        print(f"FAIL: {rel} must start with comment lines stating {', '.join('# ' + k + ':' for k in missing)} "
+              "(what it proves, which decision or sub-question it settles, and the pass condition)")
+        return 2
+    ready, why, env = fe.status(root)
+    if not ready:
+        print(f"FAIL: the project environment is not ready: {why}")
+        return 1
+
+    n = int(m.group(1))
+    pid = f"P-{n}"
+    out_dir = root / PROBES / "out" / pid
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True)
+    argv_run = ["python", str(rel)] if m.group(2) == "py" else ["bash", str(rel)]
+    before = state(root)
+    t0 = time.monotonic()
+    code, output, timed_out = fe.run(root, argv_run, timeout,
+                                     {"FORGE_PROBE_OUT": str(out_dir.relative_to(root)), "MPLBACKEND": "Agg"})
+    seconds = round(time.monotonic() - t0, 1)
+    after = state(root)
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    (out_dir / "output.txt").write_text(output, encoding="utf-8")
+
+    results = RESULT_RE.findall(output)
+    result = f"{results[-1][0]} {results[-1][1]}".strip() if results else ""
+    if timed_out:
+        verdict = "TIMEOUT"
+    elif changed:
+        verdict = "INVALID"
+    elif code != 0:
+        verdict = "ERROR"
+    elif results:
+        verdict = results[-1][0]
+    else:
+        verdict = "NO RESULT"
+    rec = {
+        "id": pid, "n": n, "script": str(rel), "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "claim": head["claim"], "settles": head["settles"], "pass_if": head["pass_if"],
+        "verdict": verdict, "result": result, "exit": code, "seconds": seconds, "timeout": timeout,
+        "environment": f"{env['kind']} ({env['spec'] or '.venv'})",
+        "ran_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "outputs": sorted(str(p.relative_to(root)) for p in out_dir.rglob("*") if p.is_file() and p.name != "output.txt"),
+        "changed_files": changed, "tail": "\n".join(output.splitlines()[-40:]),
+    }
+    (root / PROBES / f"{pid}.json").write_text(json.dumps(rec, indent=1) + "\n", encoding="utf-8")
+    write_index(root)
+
+    detail = results[-1][1].strip() if results else ""
+    print(f"{pid} {verdict}" + (f": {detail}" if detail else "") + f" ({seconds} s, exit {code})")
+    if changed:
+        print(f"  INVALID: the probe changed project files outside {PROBES}/: {', '.join(changed[:10])}")
+    for o in rec["outputs"][:10]:
+        print(f"  output: {o}")
+    print(f"  full output: {out_dir.relative_to(root)}/output.txt")
+    print(f"  record: {PROBES}/{pid}.json (listed in {PROBES}/probes.md)")
+    print("--- last lines ---")
+    print("\n".join(output.splitlines()[-20:]))
+    return 0 if verdict == "PASS" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

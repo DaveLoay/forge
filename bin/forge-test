@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """forge-test N: run slice N's checkpoint, exactly as the approved plan.md states it.
 
-The commands come from plan.md, not from the caller. `pytest ...` runs as
-`.venv/bin/python -m pytest ...` and `python ...` as `.venv/bin/python ...`.
+The commands come from plan.md, not from the caller. They run inside the project
+environment (forge-env: pixi, conda, docker or venv, declared in pipeline/env/):
+`pytest ...` as `python -m pytest ...`, and `python3 ...` as `python ...`.
 Before running, it checks that the design (design.md + plan.md) is still approved and
 that tests/ is byte-identical to what was locked. The result is written to
 pipeline/slices/slice-N.tests.json, together with a snapshot of the project files,
@@ -15,7 +16,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +23,7 @@ LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 import forge_approvals as fa  # noqa: E402
 import forge_build as fb  # noqa: E402
+import forge_env as fe  # noqa: E402
 
 TIMEOUT = 900  # seconds per command
 
@@ -64,21 +65,17 @@ def main(argv: list[str]) -> int:
     cmds = slices[n]["commands"]
     if not cmds:
         return finish(f"plan.md's Slice {n} has no runnable checkpoint command")
-    py = root / ".venv" / "bin" / "python"
-    if not py.is_file():
-        return finish("no .venv: create it (python3 -m venv .venv) and install the plan's dependencies first")
+    ready, why, _ = fe.status(root)
+    if not ready:
+        return finish(f"the project environment is not ready: {why}")
 
     for cmd in cmds:
         words = shlex.split(cmd)
         if words[0] == "pytest":
-            words = [str(py), "-m", "pytest", *words[1:]]
-        elif words[0] in ("python", "python3"):
-            words = [str(py), *words[1:]]
-        try:
-            p = subprocess.run(words, cwd=root, capture_output=True, text=True, timeout=TIMEOUT)
-            code, text = p.returncode, (p.stdout + p.stderr)
-        except subprocess.TimeoutExpired as e:
-            code, text = 124, f"timed out after {TIMEOUT}s\n{(e.stdout or '')}{(e.stderr or '')}"
+            words = ["python", "-m", "pytest", *words[1:]]
+        elif words[0] == "python3":
+            words = ["python", *words[1:]]
+        code, text, _ = fe.run(root, words, TIMEOUT)
         tail = "\n".join(str(text).splitlines()[-40:])
         rec["commands"].append({"command": cmd, "exit": code, "tail": tail})
         if code != 0:
