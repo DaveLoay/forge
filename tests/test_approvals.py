@@ -118,6 +118,28 @@ class PlanStageTests(ApprovalTests):
             self.assertEqual(guard(self.root, a, "Write", {"file_path": "pipeline/ledger.md"})[0], "deny")
             self.assertEqual(guard(self.root, a, "Read", {"file_path": "references/k/k.pdf"})[0], "deny")
 
+    def test_bubastis_fetches_linked_code_and_reads_only(self):
+        BUB, OZ = "forge:bubastis", "forge:ozymandias"
+        self.assertEqual(guard(self.root, BUB, "Bash", {"command": "refs code fetch a/b"})[0], "deny")
+        self.approve_through_index()
+        for cmd in ("refs code fetch https://github.com/a/b", "refs code list --json"):
+            self.assertEqual(guard(self.root, BUB, "Bash", {"command": cmd})[0], "pass", cmd)
+        for cmd in ("refs code fetch --any https://github.com/x/y", "refs code rm a/b", "refs fetch 2506.19108",
+                    "git clone https://github.com/a/b", "python3 references/code/a__b/train.py",
+                    "refs code fetch a/b && pip install -e references/code/a__b"):
+            self.assertEqual(guard(self.root, BUB, "Bash", {"command": cmd})[0], "deny", cmd)
+        self.assertEqual(guard(self.root, BUB, "Write", {"file_path": "pipeline/code/findings.md"})[0], "pass")
+        for p in ("pipeline/design.md", "references/code/a__b/x.py", "src/a.py"):
+            self.assertEqual(guard(self.root, BUB, "Write", {"file_path": p})[0], "deny", p)
+        self.assertEqual(guard(self.root, BUB, "WebFetch", {"url": "https://github.com/a/b"})[0], "deny")
+        # Ozymandias may list the linked repositories, but asks Bubastis to fetch them
+        self.assertEqual(guard(self.root, OZ, "Bash", {"command": "refs code list"})[0], "pass")
+        self.assertEqual(guard(self.root, OZ, "Bash", {"command": "refs code fetch a/b"})[0], "deny")
+        self.assertEqual(guard(self.root, OZ, "Write", {"file_path": "pipeline/code/findings.md"})[0], "deny")
+        # a plain session may list them too (read-only)
+        self.assertEqual(guard(self.root, None, "Bash", {"command": "refs code list"})[0], "pass")
+        self.assertEqual(guard(self.root, None, "Bash", {"command": "refs code fetch a/b"})[0], "deny")
+
     def test_design_approval_locks_tests(self):
         self.approve_through_index()
         (self.root / "pipeline" / "design.md").write_text("design")

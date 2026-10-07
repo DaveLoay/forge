@@ -46,6 +46,9 @@ flowchart TD
 
     subgraph S3["③ Plan · /forge:plan · up to 3 rounds"]
         OZ1["Ozymandias<br/>Opus · drafts / revises"]
+        BUB["Bubastis × one per code question<br/>Haiku · fetches a paper's repo, points to the lines"]
+        OZ1 -. "code questions" .-> BUB
+        BUB -. "file:line pointers (C-n)" .-> OZ1
         JJJ["J. Jonah Jameson<br/>Sonnet · criticises, with evidence"]
         SM["Smithers<br/>Sonnet · rebuts or concedes"]
         OZ2["Ozymandias<br/>Opus · rules on every critique"]
@@ -77,7 +80,7 @@ flowchart TD
     classDef file fill:#fef9c3,stroke:#ca8a04,color:#0f172a
     classDef gate fill:#dcfce7,stroke:#16a34a,color:#0f172a
     classDef tool fill:#e5e7eb,stroke:#6b7280,color:#0f172a
-    class INT,CUR,HH1,HH2,PTR,OZ1,JJJ,SM,OZ2,OZ3,MF,REV agent
+    class INT,CUR,HH1,HH2,PTR,OZ1,BUB,JJJ,SM,OZ2,OZ3,MF,REV agent
     class brief,cand,index,plan,slice,blocker,review file
     class A1,A2,A3,A4,A5 gate
     class REFS,FT tool
@@ -92,6 +95,7 @@ flowchart TD
 | **Hungry-hippo** | Haiku | 2 | The clerk: runs `refs` to verify, fetch and convert papers | `pipeline/candidates.md` |
 | **Pointer** | Haiku | 2 | Finds which paper, section and lines answer each sub-question | `pipeline/index.md` |
 | **Ozymandias** | Opus | 3 | Architect and judge: builds the project environment, drafts the design, checks facts with small probes, rules on critiques, writes tests | `design.md`, `plan.md`, `ledger.md`, `tests/`, `pipeline/env/`, probe scripts |
+| **Bubastis** | Haiku | 3 | Code scout: fetches a repository a paper links to (`refs code fetch`), searches it for what Ozymandias asked, and returns the answer with file and line pointers, one instance per question | `pipeline/code/findings.md` |
 | **J. Jonah Jameson** | Sonnet | 3 | Critic: a fresh instance every round, attacks the plan with evidence | nothing |
 | **Smithers** | Sonnet | 3 | Defender: rebuts each critique with evidence, or concedes it | nothing |
 | **MF-CODE** | Sonnet | 5 | Builds one slice of the plan, inside the environment built during Plan | `src/`, `docs/`, … never `tests/` or `pipeline/env/` |
@@ -122,11 +126,11 @@ forge is a **plugin for Claude Code**. A plugin is a folder that Claude Code loa
 
 | Building block | What it is | In forge |
 |---|---|---|
-| **Agents** (`agents/*.md`) | A specialised AI worker: a role description, a model (Opus, Sonnet or Haiku), an effort level (Sonnet and Opus agents only) and a list of tools it may use. | Interrogator, Hungry-hippo, Mr. Curiosity, Pointer, Ozymandias, J. Jonah Jameson, Smithers, MF-CODE, Reviewer |
+| **Agents** (`agents/*.md`) | A specialised AI worker: a role description, a model (Opus, Sonnet or Haiku), an effort level (Sonnet and Opus agents only) and a list of tools it may use. | Interrogator, Hungry-hippo, Mr. Curiosity, Pointer, Ozymandias, Bubastis, J. Jonah Jameson, Smithers, MF-CODE, Reviewer |
 | **Skills** (`skills/*/SKILL.md`) | Commands you type, such as `/forge:status`. | `/forge:next`, `/forge:approve`, `/forge:status`, `/forge:init` |
 | **Workflows** (`workflows/*.js`) | Small JavaScript programs that run agents in a fixed order. The *script*, not the AI, decides what runs next, so steps can't be skipped. | `/forge:investigate`, `/forge:investigate-index`, `/forge:plan`, `/forge:build` |
 | **Hooks** (`hooks/`) | Code that Claude Code runs before and after every action an agent takes. It can block the action. | the **forge guard**: it allows each agent only its own job and writes the logbook |
-| **Tools** (`bin/`) | Ordinary command-line programs that agents (and you) can run. | `forge` (the launcher), `refs` (papers), `forge-init`, `forge-approve`, `forge-gate`, `forge-env` (the project environment), `forge-probe` (small checks during Plan), `forge-test`, `forge-build-status` |
+| **Tools** (`bin/`) | Ordinary command-line programs that agents (and you) can run. | `forge` (the launcher), `refs` (papers, and the code repositories they link), `forge-init`, `forge-approve`, `forge-gate`, `forge-env` (the project environment), `forge-probe` (small checks during Plan), `forge-test`, `forge-build-status` |
 
 So forge is not one thing. It is a set of agents with narrow jobs, workflows that run them in order, a guard that keeps them in their lane, and tools that do the parts that should be exact (downloading, converting, checking, testing) without AI.
 
@@ -151,7 +155,8 @@ You talk with the Interrogator until your idea is precise. If you name papers, i
 `/forge:plan` runs up to 3 rounds of:
 
 1. **Ozymandias** (Opus) drafts or revises `pipeline/design.md` (for you) and `pipeline/plan.md` (for the builder). In the first round it writes the environment spec in `pipeline/env/` (as the brief asks) and builds it with `forge-env create`. When a decision depends on a fact it can check cheaply, it runs a **probe** with `forge-probe`: a short script with one stated claim and pass condition, such as ffprobe on the dataset's sample rate, or a spectrogram that should show the predicted peaks. Probes run in the project environment, stop after 10 minutes, may not change project files, and `forge-probe` itself records what they showed in `pipeline/probes/probes.md`.
-2. **J. Jonah Jameson** criticises them. Every critique needs evidence: an index row, a paper or a probe (`P-n`).
+   When the papers link their code (GitHub or GitLab), Ozymandias can ask about it: the exact preprocessing, a default hyperparameter, how a loss is weighted. It doesn't search the repository itself, which would spend Opus tokens on reading code. It names the repository and the question, and the workflow sends a **Bubastis** scout (Haiku) per question. Bubastis fetches the repository with `refs code fetch` (one commit, text files only, at most 50 MB, into `references/code/`) and returns the answer with file and line pointers. Ozymandias then reads only those lines in its next task and cites them as `C-n`. Round 1 starts with a short step where Ozymandias decides what to look up before drafting. A run makes at most 12 lookups (4 per task), and every one is recorded in `pipeline/code/findings.md`. The code is read as evidence and never run.
+2. **J. Jonah Jameson** criticises them. Every critique needs evidence: an index row, a paper, a probe (`P-n`) or a code finding (`C-n`).
 3. **Smithers** rebuts each critique with evidence or concedes it.
 4. **Ozymandias** rules on every critique: accepted or rejected, with a reason.
 

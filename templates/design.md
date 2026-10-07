@@ -13,7 +13,7 @@ For the human gate. Keep it under ~200 lines: this is the solution, not the code
 
 ## Key decisions
 
-Each decision cites its evidence: an `index.md` row, a reference key, or a probe (P-n).
+Each decision cites its evidence: an `index.md` row, a reference key, a probe (P-n), or a code finding (C-n · path:lines, from `pipeline/code/findings.md`).
 
 | id | decision | why | evidence |
 |---|---|---|---|

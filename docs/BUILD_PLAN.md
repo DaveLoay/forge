@@ -55,7 +55,8 @@ It is installed once from GitHub and used in every project. A project only holds
 | `hungry-hippo.md` | haiku | investigate | brief, `MISSING.md` | runs `refs fetch` / `refs convert` |
 | `mr-curiosity.md` | sonnet, ×N in parallel | investigate | one sub-question, `catalog.md` | candidate list (JSON) |
 | `pointer.md` | haiku | investigate | brief, `catalog.md`, `references/*/*.md` | `pipeline/index.md` |
-| `ozymandias.md` | opus | plan | brief, index, ledger, probe records | `design.md`, `plan.md`, rulings in `ledger.md`, `tests/`, `pipeline/env/`, probe scripts (runs `forge-env create`, `forge-probe`) |
+| `ozymandias.md` | opus | plan | brief, index, ledger, probe records, code findings | `design.md`, `plan.md`, rulings in `ledger.md`, `tests/`, `pipeline/env/`, probe scripts (runs `forge-env create`, `forge-probe`) |
+| `bubastis.md` | haiku, ×N in parallel | plan | one code question from Ozymandias, a repository linked from a paper | answer + file:line pointers (JSON), `pipeline/code/findings.md` (runs `refs code fetch`) |
 | `j-jonah-jameson.md` | sonnet | plan | design, plan, index, ledger | critiques (JSON) |
 | `smithers.md` | sonnet | plan | plan, this round's critiques, index | rebuttals or concessions + load-bearing list (JSON) |
 | `mf-code.md` | sonnet | build | `plan.md` (one slice at a time) | `src/`, `build-log.md` (runs code with `forge-env run`) |
@@ -78,7 +79,7 @@ Fills `templates/brief.md`: goal, non-goals, hypothesis, acceptance criteria (ea
 
 For round r = 1..3:
 
-1. Ozymandias drafts the plan (round 1) or revises it.
+1. Ozymandias drafts the plan (round 1) or revises it. Questions it returns about the papers' code are answered by Bubastis scouts before its next task (`C-n` findings).
 2. J. Jonah Jameson returns critiques, each `{id, severity: blocker|major|minor, claim, evidence}`. Evidence must point to an `index.md` row or a reference key. It may reopen an item already ruled on only with new evidence.
 3. Smithers answers each critique by rebutting it with evidence or conceding it, and lists the load-bearing decisions a revision must not break.
 4. Ozymandias rules on every item in `ledger.md` (accepted or rejected, with reason and evidence).
@@ -123,7 +124,7 @@ Plugin (this repo), target state:
 ```
 forge/
   .claude-plugin/  plugin.json  marketplace.json
-  agents/          interrogator  hungry-hippo  mr-curiosity  pointer  ozymandias
+  agents/          interrogator  hungry-hippo  mr-curiosity  pointer  ozymandias  bubastis
                    j-jonah-jameson  smithers  mf-code  reviewer           (.md each)
   workflows/       investigate.js  plan.js  build.js
   skills/          status/  init/

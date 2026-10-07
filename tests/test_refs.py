@@ -331,5 +331,124 @@ class TestConvert(RefsTestCase):
         self.assertIn("missing:    1", out)
 
 
+
+def tarball(files: dict, top: str = "repo-abc123") -> bytes:
+    """A .tar.gz in memory, every file under one top folder like GitHub's archives."""
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name if name.startswith(("/", "../")) else f"{top}/{name}")
+            if isinstance(data, str) and data.startswith("->"):
+                info.type, info.linkname = tarfile.SYMTYPE, data[2:]
+                tf.addfile(info)
+                continue
+            data = data.encode() if isinstance(data, str) else data
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+class CodeTests(unittest.TestCase):
+    """refs code: repositories linked from the papers. Network calls are stubbed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "proj"
+        paper = self.root / "references" / "smith2020x"
+        paper.mkdir(parents=True)
+        (paper / "smith2020x.md").write_text(
+            "# Paper\n\nCode: https://github.com/Smith/Spec\\_Net. See github.com/orgs/x, "
+            "https://github.com/topics/audio and https://gitlab.com/lab/tool.git\n")
+        self.archives = {}
+        self._orig = (refs.remote_head, refs.open_archive)
+        refs.remote_head = lambda url: "a" * 40
+        refs.open_archive = lambda url: contextlib.closing(io.BytesIO(self.archives[url.split("/")[4]]))
+
+    def tearDown(self):
+        refs.remote_head, refs.open_archive = self._orig
+        os.environ.pop("FORGE_CODE_MAX_MB", None)
+        self.tmp.cleanup()
+
+    def code(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = refs.main(["--root", str(self.root), "code", *argv])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_parse_repo(self):
+        self.assertEqual(refs.parse_repo("https://github.com/a/b.git"), ("github.com", "a", "b"))
+        self.assertEqual(refs.parse_repo("https://www.github.com/a/b/tree/main/src"), ("github.com", "a", "b"))
+        self.assertEqual(refs.parse_repo("a/b"), ("github.com", "a", "b"))
+        self.assertEqual(refs.parse_repo("https://gitlab.com/g/r"), ("gitlab.com", "g", "r"))
+        for bad in ("https://github.com/orgs/x", "https://example.com/a/b", "not a repo", "a/.."):
+            self.assertIsNone(refs.parse_repo(bad), bad)
+        self.assertEqual(refs.repo_slug("github.com", "Smith", "Spec_Net"), "smith__spec_net")
+        self.assertEqual(refs.repo_slug("gitlab.com", "g", "r"), "gitlab__g__r")
+
+    def test_links_found_in_papers(self):
+        links = refs.repo_links(refs.Project(self.root))
+        self.assertEqual(sorted(e["url"] for e in links.values()),
+                         ["https://github.com/Smith/Spec_Net", "https://gitlab.com/lab/tool"])
+        self.assertEqual(links["https://github.com/smith/spec_net"]["papers"], ["smith2020x"])
+        rc, out = self.code("list", "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(json.loads(out)["linked"]), 2)
+
+    def test_extract_keeps_text_only(self):
+        dest = Path(self.tmp.name) / "x"
+        data = tarball({"src/model.py": "def f():\n    return 1\n", "w.pt": b"weights", "img.dat": b"\x89PNG\0\0",
+                        "big.txt": "x" * 2000, ".git/config": "[core]", "link.py": "->/etc/passwd",
+                        "../evil.py": "boom", "/abs.py": "boom"})
+        st = refs.extract_code(io.BytesIO(data), dest, max_bytes=10_000, max_file=1000)
+        self.assertEqual(sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()), ["src/model.py"])
+        self.assertEqual((st["files"], st["skipped_large"], st["skipped_binary"], st["complete"]), (1, 1, 2, True))
+        self.assertFalse((Path(self.tmp.name) / "evil.py").exists())
+
+    def test_extract_stops_at_caps(self):
+        files = {f"f{i}.py": "x" * 400 for i in range(10)}
+        st = refs.extract_code(io.BytesIO(tarball(files)), Path(self.tmp.name) / "a", max_bytes=1000)
+        self.assertEqual((st["files"], st["complete"]), (2, False))
+        capped = refs._Capped(io.BytesIO(tarball(files)), limit=100)
+        st = refs.extract_code(capped, Path(self.tmp.name) / "b", max_bytes=10_000)
+        self.assertFalse(st["complete"])
+
+    def test_fetch_only_linked_repos_and_pin_commit(self):
+        self.archives["Spec_Net"] = tarball({"train.py": "lr = 3e-4\n", "README.md": "# Spec"})
+        rc, out = self.code("fetch", "smith/spec_net")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("fetched  https://github.com/Smith/Spec_Net @ aaaaaaaaaaaa → references/code/smith__spec_net/", out)
+        folder = self.root / "references" / "code" / "smith__spec_net"
+        self.assertEqual((folder / "train.py").read_text(), "lr = 3e-4\n")
+        rec = json.loads((folder / ".forge-code.json").read_text())
+        self.assertEqual((rec["commit"], rec["papers"], rec["files"]), ("a" * 40, ["smith2020x"], 2))
+        self.assertIn("| smith__spec_net | https://github.com/Smith/Spec_Net | aaaaaaaaaaaa | 2 |",
+                      (self.root / "references" / "code" / "index.md").read_text())
+        self.assertIn("present", self.code("fetch", "https://github.com/Smith/Spec_Net")[1])
+        # the code folder is not mistaken for a paper
+        self.assertEqual([d.name for d, _ in refs.Project(self.root).papers()], ["smith2020x"])
+
+        rc, out = self.code("fetch", "other/repo")
+        self.assertEqual(rc, 1)
+        self.assertIn("no converted paper links this repository", out)
+        self.assertFalse((self.root / "references" / "code" / "other__repo").exists())
+        self.archives["repo"] = tarball({"a.py": "x = 1\n"})
+        self.assertEqual(self.code("fetch", "--any", "other/repo")[0], 0)
+        with self.assertRaises(SystemExit):
+            self.code("fetch", "--an", "x/y")  # no abbreviations of --any
+
+        rc, out = self.code("rm", "Smith/Spec_Net")
+        self.assertIn("removed", out)
+        self.assertFalse(folder.exists())
+
+    def test_fetch_failure_leaves_nothing(self):
+        def unreachable(url):
+            raise refs.CodeError("repository not reachable")
+        refs.remote_head = unreachable
+        rc, out = self.code("fetch", "smith/spec_net")
+        self.assertEqual(rc, 1)
+        self.assertIn("not reachable", out)
+        self.assertEqual(list((self.root / "references" / "code").glob("smith*")), [])
+
 if __name__ == "__main__":
     unittest.main()

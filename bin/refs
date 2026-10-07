@@ -11,6 +11,7 @@ Commands:
   refs pool add|remove|list|find   the paper pool: converted papers that fetch reuses first
   refs marker start|stop|status   control the local Marker OCR server (convert starts it on demand)
   refs marker env [KEY=VALUE ...]  machine-specific Marker settings, e.g. VLLM_DOCKER_IMAGE
+  refs code list|fetch|rm         code repositories linked from the papers (text files, pinned commit)
 
 Standard library only (Python 3.10+). OCR runs on a self-hosted Marker server
 by default (free, local); Mistral is optional. Environment:
@@ -21,6 +22,7 @@ by default (free, local); Mistral is optional. Environment:
   MISTRAL_OCR_MODEL model name (default mistral-ocr-latest)
   FORGE_EMAIL       contact address for the Crossref polite pool and Unpaywall
   FORGE_CACHE_DIR   OCR cache location (default ~/.cache/forge/ocr)
+  FORGE_CODE_MAX_MB size cap per fetched repository (default 50)
 """
 
 from __future__ import annotations
@@ -40,8 +42,10 @@ import socket
 import subprocess
 import threading
 import sys
+import tarfile
 import time
 import unicodedata
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1049,6 +1053,299 @@ def cmd_pool(proj: Project, args) -> int:
             info("no pool paper matches.")
     return 0
 
+# --------------------------------------------------------------------------- code repositories
+
+# Repositories linked from the converted papers. GitHub and GitLab only: their archive endpoints
+# give a tarball of one commit, so no git history is kept. Only text files up to CODE_MAX_FILE are
+# extracted, and a repository stops at FORGE_CODE_MAX_MB. Agents read this code; nothing runs it.
+REPO_URL_RE = re.compile(
+    r"https?://(?:www\.)?(github\.com|gitlab\.com)/([A-Za-z0-9][A-Za-z0-9_.-]*)/([A-Za-z0-9_.-]+)", re.I)
+NOT_OWNERS = {"orgs", "topics", "features", "sponsors", "about", "marketplace", "settings", "site", "apps",
+              "collections", "login", "join", "explore", "pricing", "users", "help", "search", "dashboard"}
+CODE_MAX_FILE = 1 << 20
+CODE_BINARY_EXT = set("""
+    .png .jpg .jpeg .gif .bmp .tif .tiff .webp .ico .svg .eps .psd .wav .mp3 .flac .ogg .m4a .mp4 .avi .mov
+    .mkv .webm .zip .tar .gz .tgz .bz2 .xz .7z .rar .pt .pth .ckpt .bin .safetensors .onnx .h5 .hdf5 .npy
+    .npz .pkl .pickle .joblib .mat .tfrecord .parquet .arrow .feather .lmdb .db .sqlite .pdf .doc .docx
+    .ppt .pptx .xls .xlsx .so .dll .dylib .o .a .exe .class .jar .pyc .whl .ttf .otf .woff .woff2""".split())
+CODE_RECORD = ".forge-code.json"
+
+
+class CodeError(RuntimeError):
+    """A repository could not be fetched; the message says why."""
+
+
+class _DownloadTooLarge(Exception):
+    pass
+
+
+def code_max_bytes() -> int:
+    return int(float(os.environ.get("FORGE_CODE_MAX_MB") or 50) * (1 << 20))
+
+
+def code_max_download() -> int:
+    """Compressed bytes read before giving up: archives full of data or weights stop early."""
+    return 4 * code_max_bytes()
+
+
+def parse_repo(text: str) -> tuple[str, str, str] | None:
+    """(host, owner, repo) for a GitHub/GitLab URL, or for `owner/repo` (GitHub)."""
+    text = text.strip()
+    if "://" not in text:
+        text = "https://github.com/" + text
+    m = REPO_URL_RE.match(text)
+    if not m:
+        return None
+    host, owner, repo = m.group(1).lower(), m.group(2), re.sub(r"\.git$", "", m.group(3).rstrip("."))
+    if owner.lower() in NOT_OWNERS or repo in ("", ".", ".."):
+        return None
+    return host, owner, repo
+
+
+def repo_url(host: str, owner: str, repo: str) -> str:
+    return f"https://{host}/{owner}/{repo}"
+
+
+def repo_slug(host: str, owner: str, repo: str) -> str:
+    """Folder name under references/code/. Lowercase: GitHub and GitLab names are case-insensitive."""
+    slug = f"{owner}__{repo}" if host == "github.com" else f"{host.split('.')[0]}__{owner}__{repo}"
+    return slug.lower()
+
+
+def code_dir(proj: Project) -> Path:
+    return proj.refs / "code"
+
+
+def repo_links(proj: Project) -> dict[str, dict]:
+    """Every repository a converted paper links to: lowercased URL -> {url, parts, papers}."""
+    links: dict[str, dict] = {}
+    for d, _ in proj.papers():
+        try:
+            text = (d / f"{d.name}.md").read_text(encoding="utf-8", errors="replace").replace("\\_", "_")
+        except OSError:
+            continue
+        for m in REPO_URL_RE.finditer(text):
+            parts = parse_repo(m.group(0))
+            if not parts:
+                continue
+            url = repo_url(*parts)
+            e = links.setdefault(url.lower(), {"url": url, "parts": parts, "papers": []})
+            if d.name not in e["papers"]:
+                e["papers"].append(d.name)
+    return links
+
+
+def code_fetched(proj: Project) -> list[dict]:
+    out = []
+    root = code_dir(proj)
+    for rec in sorted(root.glob(f"*/{CODE_RECORD}")) if root.is_dir() else []:
+        try:
+            out.append({**json.loads(rec.read_text(encoding="utf-8")), "folder": rec.parent.name})
+        except (OSError, json.JSONDecodeError):
+            pass
+    return out
+
+
+def remote_head(url: str) -> str:
+    """The commit HEAD points to, from `git ls-remote` (works for any public git host)."""
+    try:
+        r = subprocess.run(["git", "ls-remote", url, "HEAD"], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true"})
+    except FileNotFoundError:
+        raise CodeError("git is not installed; it is needed to find the commit to fetch") from None
+    except subprocess.TimeoutExpired:
+        raise CodeError("`git ls-remote` timed out") from None
+    m = re.match(r"([0-9a-f]{40})\s+HEAD", r.stdout)
+    if not m:
+        why = (r.stderr.strip().splitlines() or ["no HEAD commit"])[-1]
+        raise CodeError(f"repository not reachable (private, renamed or deleted?): {why}")
+    return m.group(1)
+
+
+def archive_url(host: str, owner: str, repo: str, sha: str) -> str:
+    if host == "github.com":
+        return f"https://codeload.github.com/{owner}/{repo}/tar.gz/{sha}"
+    return f"https://gitlab.com/{owner}/{repo}/-/archive/{sha}/{repo}-{sha}.tar.gz"
+
+
+def open_archive(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent()})
+    return _OPENER.open(req, timeout=120)
+
+
+class _Capped:
+    """A read-only stream that raises _DownloadTooLarge after `limit` bytes."""
+
+    def __init__(self, raw, limit: int):
+        self.raw, self.limit, self.n = raw, limit, 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.raw.read(size)
+        self.n += len(data)
+        if self.n > self.limit:
+            raise _DownloadTooLarge()
+        return data
+
+
+def extract_code(stream, dest: Path, max_bytes: int, max_file: int = CODE_MAX_FILE) -> dict:
+    """Extract the text files of a .tar.gz stream into dest, dropping its top folder.
+
+    Skips links, binaries (by extension or a NUL byte), files over max_file and anything under
+    .git/; stops (complete=False) once max_bytes are written or the download cap is reached."""
+    st = {"files": 0, "bytes": 0, "skipped_large": 0, "skipped_binary": 0, "complete": True}
+    try:
+        with tarfile.open(fileobj=stream, mode="r|*") as tf:
+            for m in tf:
+                if not m.isfile():
+                    continue
+                full = Path(m.name).parts
+                parts = full[1:]
+                if not parts or m.name.startswith("/") or ".." in full or ".git" in parts:
+                    continue
+                if m.size > max_file:
+                    st["skipped_large"] += 1
+                    continue
+                if Path(parts[-1]).suffix.lower() in CODE_BINARY_EXT:
+                    st["skipped_binary"] += 1
+                    continue
+                data = tf.extractfile(m).read()
+                if b"\0" in data[:8192]:
+                    st["skipped_binary"] += 1
+                    continue
+                if st["bytes"] + len(data) > max_bytes:
+                    st["complete"] = False
+                    break
+                out = dest.joinpath(*parts)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(data)
+                st["files"] += 1
+                st["bytes"] += len(data)
+    except _DownloadTooLarge:
+        st["complete"] = False
+    return st
+
+
+def fetch_repo(proj: Project, parts: tuple[str, str, str], papers: list[str]) -> tuple[str, dict]:
+    """Fetch one repository into references/code/<slug>/. Returns ("present" | "fetched", record)."""
+    url, folder = repo_url(*parts), code_dir(proj) / repo_slug(*parts)
+    rec_f = folder / CODE_RECORD
+    if rec_f.is_file():
+        return "present", {**json.loads(rec_f.read_text(encoding="utf-8")), "folder": folder.name}
+    sha = remote_head(url)
+    tmp = folder.with_name(folder.name + ".part")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    try:
+        with open_archive(archive_url(*parts, sha)) as r:
+            st = extract_code(_Capped(r, code_max_download()), tmp, code_max_bytes())
+    except (OSError, tarfile.TarError, EOFError, zlib.error) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise CodeError(f"download failed: {e}") from None
+    rec = {"url": url, "commit": sha, "fetched": today(), "papers": papers, **st}
+    (tmp / CODE_RECORD).write_text(json.dumps(rec, indent=1) + "\n", encoding="utf-8")
+    shutil.rmtree(folder, ignore_errors=True)
+    tmp.rename(folder)
+    return "fetched", {**rec, "folder": folder.name}
+
+
+def mb(n: int) -> str:
+    return f"{n / (1 << 20):.1f} MB"
+
+
+def describe_repo(rec: dict) -> str:
+    skipped = [f"{rec[k]} {k.split('_')[1]}" for k in ("skipped_large", "skipped_binary") if rec.get(k)]
+    text = (f"{rec['url']} @ {rec['commit'][:12]} → references/code/{rec['folder']}/ "
+            f"({rec['files']} files, {mb(rec['bytes'])}{'; skipped ' + ', '.join(skipped) if skipped else ''})")
+    if not rec.get("complete", True):
+        text += f"; INCOMPLETE: stopped at the {mb(code_max_bytes())} cap, some files are missing"
+    return text
+
+
+def write_code_index(proj: Project) -> None:
+    recs = code_fetched(proj)
+    root = code_dir(proj)
+    if not recs:
+        (root / "index.md").unlink(missing_ok=True)
+        return
+    lines = ["# Code", "",
+             "Repositories linked from the papers, fetched with `refs code fetch`: text files only, pinned to "
+             "one commit. Read them as evidence of what the authors did. Never run or import them.", "",
+             "| folder | repository | commit | files | size | complete | linked from |", "|---|---|---|---|---|---|---|"]
+    for r in recs:
+        lines.append(f"| {r['folder']} | {r['url']} | {r['commit'][:12]} | {r['files']} | {mb(r['bytes'])} | "
+                     f"{'yes' if r.get('complete', True) else 'no'} | {', '.join(r.get('papers') or []) or '(added by hand)'} |")
+    (root / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_code(proj: Project, args) -> int:
+    links = repo_links(proj)
+    if args.action == "list":
+        have = {r["url"].lower(): r for r in code_fetched(proj)}
+        total = sum(r["bytes"] for r in have.values())
+        if args.json:
+            print(json.dumps({
+                "linked": [{"url": e["url"], "papers": e["papers"], "fetched": k in have,
+                            "folder": have[k]["folder"] if k in have else None,
+                            "commit": have[k]["commit"] if k in have else None} for k, e in links.items()],
+                "fetched_by_hand": [r["url"] for k, r in have.items() if k not in links],
+                "fetched_bytes": total}, indent=1))
+            return 0
+        if not links and not have:
+            info("no converted paper links a GitHub or GitLab repository")
+            return 0
+        for k, e in links.items():
+            where = f"  → references/code/{have[k]['folder']}/ @ {have[k]['commit'][:12]}" if k in have else ""
+            info(f"{'fetched' if k in have else 'linked '}  {e['url']}  (in {', '.join(e['papers'])}){where}")
+        for k, r in have.items():
+            if k not in links:
+                info(f"fetched  {r['url']}  (added by hand)  → references/code/{r['folder']}/ @ {r['commit'][:12]}")
+        info(f"{len(links)} repositories linked from the papers; {len(have)} fetched ({mb(total)} in references/code/)")
+        return 0
+
+    if not args.targets:
+        die(f"`refs code {args.action}` needs at least one repository (URL or owner/repo)")
+    root = code_dir(proj)
+    root.mkdir(parents=True, exist_ok=True)
+    failed = 0
+    with (root / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # parallel fetches of the same repository wait for each other
+        for t in args.targets:
+            parts = parse_repo(t)
+            if not parts:
+                warn(f"{t}: not a GitHub or GitLab repository URL")
+                failed += 1
+                continue
+            link = links.get(repo_url(*parts).lower())
+            if link:
+                parts = link["parts"]  # the spelling the paper uses
+            url = repo_url(*parts)
+            if args.action == "rm":
+                folder = root / repo_slug(*parts)
+                if folder.is_dir():
+                    shutil.rmtree(folder)
+                    info(f"removed  references/code/{folder.name}/")
+                else:
+                    info(f"absent   {url}")
+                continue
+            if not link and not args.any:
+                warn(f"{url}: no converted paper links this repository, so it was not fetched "
+                     "(`refs code list` shows the linked ones; add --any to fetch it anyway)")
+                failed += 1
+                continue
+            try:
+                status, rec = fetch_repo(proj, parts, link["papers"] if link else [])
+            except CodeError as e:
+                warn(f"{url}: {e}")
+                proj.write_log(f"code {url}: FAILED {e}")
+                failed += 1
+                continue
+            info(f"{status:<8} {describe_repo(rec)}")
+            if status == "fetched":
+                proj.write_log(f"code {url} @ {rec['commit']}: {rec['files']} files, {rec['bytes']} bytes")
+        write_code_index(proj)
+    return 1 if failed else 0
+
+
 # --------------------------------------------------------------------------- commands
 
 def cmd_convert(proj: Project, args) -> int:
@@ -1344,6 +1641,7 @@ def cmd_status(proj: Project, args) -> int:
         print(json.dumps({"converted": len(papers), "keys": [d.name for d, _ in papers],
                           "inbox_waiting": len(inbox), "inbox_files": [p.name for p in inbox],
                           "missing": len(read_missing(proj)), "unverified": unverified,
+                          "code_repos": len(code_fetched(proj)),
                           "ocr": ocr_status().split(":", 1)[1].strip()}, indent=1))
         return 0
     cached = sum(1 for p in inbox if is_cached(sha256_file(p)))
@@ -1352,6 +1650,8 @@ def cmd_status(proj: Project, args) -> int:
     info(f"converted:  {len(papers)}" + (f" ({len(unverified)} unverified: {', '.join(unverified)})" if unverified else ""))
     info(f"inbox:      {len(inbox)} PDF(s) waiting" + (f", {cached} already in OCR cache" if inbox else ""))
     info(f"missing:    {len(missing)}")
+    code = code_fetched(proj)
+    info(f"code:       {len(code)} repositories fetched" + (f" ({mb(sum(r['bytes'] for r in code))})" if code else ""))
     info(ocr_status())
     return 0
 
@@ -1392,11 +1692,17 @@ def main(argv: list[str] | None = None) -> int:
     mk.add_argument("action", choices=("start", "stop", "status", "env"))
     mk.add_argument("settings", nargs="*", metavar="KEY=VALUE",
                     help="for env: Marker settings to save (KEY= removes one)")
+    cd = sub.add_parser("code", allow_abbrev=False,
+                        help="code repositories linked from the papers: list them, fetch them (text files, pinned commit), rm")
+    cd.add_argument("action", choices=("list", "fetch", "rm"))
+    cd.add_argument("targets", nargs="*", metavar="REPO", help="GitHub/GitLab URL or owner/repo (fetch, rm)")
+    cd.add_argument("--any", action="store_true", help="fetch a repository even if no converted paper links it")
+    cd.add_argument("--json", action="store_true", help="list: machine-readable output")
     args = ap.parse_args(argv)
     proj = Project.find(args.root)
     handler = {"convert": cmd_convert, "fetch": cmd_fetch, "catalog": cmd_catalog,
                "bib": cmd_bib, "status": cmd_status, "marker": cmd_marker,
-               "resolve": cmd_resolve, "pool": cmd_pool}[args.cmd]
+               "resolve": cmd_resolve, "pool": cmd_pool, "code": cmd_code}[args.cmd]
     try:
         return handler(proj, args)
     except KeyboardInterrupt:

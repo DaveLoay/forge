@@ -78,7 +78,18 @@ STAGES: dict[str, dict] = {
         "write": ["pipeline/design.md", "pipeline/plan.md", "pipeline/ledger.md", "tests/**",
                   "pipeline/env/**", "pipeline/probes/P-*.py", "pipeline/probes/P-*.sh"],
         # the environment spec it writes, and probes: small checks whose records forge-probe writes
-        "bash": ["forge-env create", "forge-env status", "forge-probe"],
+        "bash": ["forge-env create", "forge-env status", "forge-probe", "refs code list"],
+        "pdf_downloads": False,
+        "read_pdfs": False,
+        "requires": "index",
+    },
+    "forge:bubastis": {
+        "label": "stage 3/5 · Plan · Bubastis",
+        "tools": {"Read", "Glob", "Grep", "Write", "Bash"},
+        "write": ["pipeline/code/findings.md"],
+        # fetches only repositories a converted paper links (no --any), then reads them; never runs them
+        "bash": ["refs code fetch", "refs code list"],
+        "bash_forbid": ["--any"],
         "pdf_downloads": False,
         "read_pdfs": False,
         "requires": "index",
@@ -224,7 +235,7 @@ def bash_is_readonly(cmd: str) -> bool:
         elif exe in ("forge-gate", "forge-build-status"):
             continue
         elif exe in ("refs", "forge", "forge-env"):
-            if len(words) < 2 or words[1] != "status":
+            if words[1:2] != ["status"] and words[:3] != ["refs", "code", "list"]:
                 return False
         elif exe == "find":
             if any(w in ("-delete", "-exec", "-execdir", "-ok", "-fprint") for w in words):
@@ -318,6 +329,8 @@ def on_pre_tool_use(root: Path, ev: dict) -> None:
             if (SHELL_META_RE.search(cmd)
                     or not any(words[:len(p.split())] == p.split() for p in stage["bash"])):
                 return block(f"{stage['label']} may only run single commands starting with: {', '.join(stage['bash'])}.")
+            if any(w in stage.get("bash_forbid", ()) for w in words):
+                return block(f"{stage['label']} may not use {', '.join(stage['bash_forbid'])}.")
             for prefix, gate in (stage.get("bash_requires") or {}).items():
                 if words[:len(prefix.split())] == prefix.split() or (words[:2] == ["refs", "fetch"] and "curiosity" in words):
                     ok, why = forge_approvals.check(root, gate)
